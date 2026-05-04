@@ -1,21 +1,45 @@
 import uuid
 import logging
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.ext.asyncio import AsyncSession
 from dotenv import load_dotenv
 
 from models.schemas import UploadResponse, ExtractionResult, DocumentStatus
 from services.ocr import extract_text_from_file
 from services.extractor import extract_structured_data
+from services.storage import init_storage, upload_file, get_file_url
+from database.connection import init_db, get_db
+from database import crud
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# ── Startup / Shutdown ────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Runs on startup and shutdown.
+    Startup  → create DB tables + MinIO bucket
+    Shutdown → nothing needed
+    """
+    logger.info("Starting up DocParse API...")
+    await init_db()        # create tables if not exist
+    init_storage()         # create MinIO bucket if not exist
+    logger.info("Database and storage ready.")
+    yield
+    logger.info("Shutting down DocParse API...")
+
+
+# ── FastAPI app ───────────────────────────────────
 app = FastAPI(
     title="DocParse API",
     description="Intelligent Document Processing Pipeline",
-    version="1.0.0"
+    version="2.0.0",
+    lifespan=lifespan
 )
 
 # Allow React frontend to call this API
@@ -26,97 +50,187 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Temporary in-memory store (we replace with PostgreSQL in Phase 2)
-results_store: dict = {}
-
 ALLOWED_TYPES = {"application/pdf", "image/png", "image/jpeg", "image/tiff"}
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
 
+
+# ── Health check ──────────────────────────────────
 @app.get("/")
 def root():
-    return {"message": "DocParse API is running", "version": "1.0.0"}
+    return {"message": "DocParse API is running", "version": "2.0.0"}
+
 
 @app.get("/health")
 def health():
     return {"status": "healthy"}
 
+
+# ── Upload endpoint ───────────────────────────────
 @app.post("/upload", response_model=UploadResponse)
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db)   # DB session injected automatically
+):
     """
-    Upload a document (PDF/image) → OCR → LLM extraction → return doc_id
+    Upload a document → save to MinIO → OCR → LLM → save to DB → return doc_id
     """
-    # Validate file type
+    # Step 1: Validate file type
     if file.content_type not in ALLOWED_TYPES:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported file type: {file.content_type}. Use PDF, PNG, JPG or TIFF."
         )
 
-    # Read file bytes
+    # Step 2: Read bytes and validate size
     file_bytes = await file.read()
-
-    # Validate file size
     if len(file_bytes) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=400,
             detail="File too large. Maximum size is 20MB."
         )
 
-    # Generate unique document ID
-    doc_id = str(uuid.uuid4())
-    logger.info(f"Processing document: {file.filename} [{doc_id}]")
+    # Step 3: Create document record in DB (status = processing)
+    doc = await crud.create_document(
+        db=db,
+        filename=file.filename,
+        content_type=file.content_type,
+        s3_key=""   # will update after MinIO upload
+    )
+    doc_id = doc.id
+    logger.info(f"Created document record: {doc_id}")
 
     try:
-        # Step 1: OCR — extract raw text
-        logger.info("Step 1/2: Running OCR...")
+        # Step 4: Upload original file to MinIO
+        logger.info("Step 1/3: Uploading to MinIO...")
+        s3_key = upload_file(
+            file_bytes=file_bytes,
+            filename=file.filename,
+            content_type=file.content_type,
+            doc_id=str(doc_id)
+        )
+        # Save the s3_key back to the document record
+        doc.s3_key = s3_key
+
+        # Step 5: OCR — extract raw text
+        logger.info("Step 2/3: Running OCR...")
         raw_text = extract_text_from_file(file_bytes, file.filename)
 
-        # Step 2: LLM — extract structured data
-        logger.info("Step 2/2: Running LLM extraction...")
+        # Step 6: LLM — extract structured data
+        logger.info("Step 3/3: Running LLM extraction...")
         extraction = extract_structured_data(raw_text)
 
-        # Store result
-        results_store[doc_id] = {
-            "doc_id": doc_id,
-            "status": DocumentStatus.done,
-            "document_type": extraction.get("document_type", "unknown"),
-            "extracted_data": extraction.get("extracted_data", {}),
-            "confidence": extraction.get("confidence", {}),
-            "raw_text": raw_text,
-            "filename": file.filename,
-        }
+        # Step 7: Save extraction result to DB
+        await crud.create_extraction_result(
+            db=db,
+            doc_id=doc_id,
+            document_type=extraction.get("document_type", "unknown"),
+            extracted_data=extraction.get("extracted_data", {}),
+            confidence=extraction.get("confidence", {}),
+            raw_text=raw_text
+        )
+
+        # Step 8: Update document status to done
+        await crud.update_document_status(db, doc_id, "done")
+        logger.info(f"Document processed successfully: {doc_id}")
 
         return UploadResponse(
-            doc_id=doc_id,
+            doc_id=str(doc_id),
             status=DocumentStatus.done,
             message=f"Document processed successfully as {extraction.get('document_type')}"
         )
 
     except Exception as e:
-        logger.error(f"Processing failed: {e}")
-        results_store[doc_id] = {
-            "doc_id": doc_id,
-            "status": DocumentStatus.error,
-            "error": str(e)
-        }
+        logger.error(f"Processing failed for {doc_id}: {e}")
+
+        # Save error result so the user knows what went wrong
+        await crud.create_error_result(
+            db=db,
+            doc_id=doc_id,
+            error_message=str(e)
+        )
+        await crud.update_document_status(db, doc_id, "error")
+
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/results/{doc_id}", response_model=ExtractionResult)
-def get_results(doc_id: str):
-    """Get extraction results for a document by its ID."""
-    if doc_id not in results_store:
-        raise HTTPException(status_code=404, detail="Document not found")
-    return results_store[doc_id]
 
+# ── Get results endpoint ──────────────────────────
+@app.get("/results/{doc_id}", response_model=ExtractionResult)
+async def get_results(
+    doc_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get extraction results for a document by its ID.
+    Reads from PostgreSQL — persists across restarts.
+    """
+    try:
+        uid = uuid.UUID(doc_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid document ID format")
+
+    doc = await crud.get_document(db, uid)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    result = doc.result
+    if not result:
+        raise HTTPException(status_code=404, detail="Result not ready yet")
+
+    return ExtractionResult(
+        doc_id=str(doc.id),
+        status=DocumentStatus(doc.status),
+        document_type=result.document_type,
+        extracted_data=result.extracted_data,
+        confidence=result.confidence,
+        raw_text=result.raw_text,
+        error=result.error
+    )
+
+
+# ── List all documents endpoint ───────────────────
 @app.get("/documents")
-def list_documents():
-    """List all processed documents."""
+async def list_documents(
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    List all uploaded documents with their status.
+    Reads from PostgreSQL.
+    """
+    docs = await crud.get_all_documents(db)
     return [
         {
-            "doc_id": v["doc_id"],
-            "filename": v.get("filename", "unknown"),
-            "status": v["status"],
-            "document_type": v.get("document_type", "unknown"),
+            "doc_id":        str(d.id),
+            "filename":      d.filename,
+            "status":        d.status,
+            "created_at":    d.created_at.isoformat(),
+            "download_url":  get_file_url(d.s3_key) if d.s3_key else None
         }
-        for v in results_store.values()
+        for d in docs
     ]
+
+
+# ── Get single document with download URL ─────────
+@app.get("/documents/{doc_id}")
+async def get_document(
+    doc_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get a single document with a temporary download URL.
+    """
+    try:
+        uid = uuid.UUID(doc_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid document ID format")
+
+    doc = await crud.get_document(db, uid)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {
+        "doc_id":       str(doc.id),
+        "filename":     doc.filename,
+        "status":       doc.status,
+        "created_at":   doc.created_at.isoformat(),
+        "download_url": get_file_url(doc.s3_key) if doc.s3_key else None
+    }
