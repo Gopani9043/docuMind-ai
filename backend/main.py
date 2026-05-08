@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 import uuid
 import logging
 from contextlib import asynccontextmanager
@@ -234,3 +236,11 @@ async def get_document(
         "created_at":   doc.created_at.isoformat(),
         "download_url": get_file_url(doc.s3_key) if doc.s3_key else None
     }
+    @app.get("/benchmark")
+    def get_benchmark():
+        """Serves benchmarks.json to the frontend."""
+        path = Path(__file__).parent / "benchmarks.json"
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="No benchmark data yet. Run tests/benchmark.py first.")
+        with open(path) as f:
+            return json.load(f)

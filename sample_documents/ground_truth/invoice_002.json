@@ -1,0 +1,12 @@
+{
+  "document_type": "invoice",
+  "extracted_data": {
+    "invoice_number": "RE-2024-089",
+    "issue_date": "20. November 2024",
+    "due_date": "20. Dezember 2024",
+    "vendor_name": "Schmidt Consulting GmbH",
+    "total_amount": 3808.00,
+    "currency": "EUR",
+    "vat_amount": 608.00
+  }
+}

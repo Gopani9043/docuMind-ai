@@ -1,0 +1,9 @@
+{
+  "document_type": "receipt",
+  "extracted_data": {
+    "vendor_name": "REWE Supermarkt Frankfurt",
+    "date": "03.05.2026",
+    "total_amount": 13.12,
+    "currency": "EUR"
+  }
+}

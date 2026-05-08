@@ -1,0 +1,152 @@
+{
+  "overall_accuracy": 100.0,
+  "total_documents": 4,
+  "results": [
+    {
+      "filename": "contract_001.pdf",
+      "accuracy": 100.0,
+      "correct": 5,
+      "total": 5,
+      "field_scores": {
+        "start_date": {
+          "expected": "01 January 2025",
+          "predicted": "01 January 2025",
+          "correct": true
+        },
+        "end_date": {
+          "expected": "31 December 2025",
+          "predicted": "31 December 2025",
+          "correct": true
+        },
+        "value": {
+          "expected": 48000.0,
+          "predicted": 48000.0,
+          "correct": true
+        },
+        "currency": {
+          "expected": "EUR",
+          "predicted": "EUR",
+          "correct": true
+        },
+        "document_type": {
+          "expected": "contract",
+          "predicted": "contract",
+          "correct": true
+        }
+      },
+      "document_type": "contract"
+    },
+    {
+      "filename": "invoice_002.pdf",
+      "accuracy": 100.0,
+      "correct": 8,
+      "total": 8,
+      "field_scores": {
+        "invoice_number": {
+          "expected": "RE-2024-089",
+          "predicted": "RE-2024-089",
+          "correct": true
+        },
+        "issue_date": {
+          "expected": "20. November 2024",
+          "predicted": "20. November 2024",
+          "correct": true
+        },
+        "due_date": {
+          "expected": "20. Dezember 2024",
+          "predicted": "20. Dezember 2024",
+          "correct": true
+        },
+        "vendor_name": {
+          "expected": "Schmidt Consulting GmbH",
+          "predicted": "Schmidt Consulting GmbH",
+          "correct": true
+        },
+        "total_amount": {
+          "expected": 3808.0,
+          "predicted": 3808.0,
+          "correct": true
+        },
+        "currency": {
+          "expected": "EUR",
+          "predicted": "EUR",
+          "correct": true
+        },
+        "vat_amount": {
+          "expected": 608.0,
+          "predicted": 608.0,
+          "correct": true
+        },
+        "document_type": {
+          "expected": "invoice",
+          "predicted": "invoice",
+          "correct": true
+        }
+      },
+      "document_type": "invoice"
+    },
+    {
+      "filename": "receipt_001.pdf",
+      "accuracy": 100.0,
+      "correct": 5,
+      "total": 5,
+      "field_scores": {
+        "vendor_name": {
+          "expected": "REWE Supermarkt Frankfurt",
+          "predicted": "REWE Supermarkt Frankfurt",
+          "correct": true
+        },
+        "date": {
+          "expected": "03.05.2026",
+          "predicted": "03.05.2026",
+          "correct": true
+        },
+        "total_amount": {
+          "expected": 13.12,
+          "predicted": 13.12,
+          "correct": true
+        },
+        "currency": {
+          "expected": "EUR",
+          "predicted": "EUR",
+          "correct": true
+        },
+        "document_type": {
+          "expected": "receipt",
+          "predicted": "receipt",
+          "correct": true
+        }
+      },
+      "document_type": "receipt"
+    },
+    {
+      "filename": "report_001.pdf",
+      "accuracy": 100.0,
+      "correct": 4,
+      "total": 4,
+      "field_scores": {
+        "title": {
+          "expected": "Q3 2024 FINANCIAL REPORT",
+          "predicted": "Q3 2024 FINANCIAL REPORT",
+          "correct": true
+        },
+        "date": {
+          "expected": "October 15 2024",
+          "predicted": "October 15 2024",
+          "correct": true
+        },
+        "author": {
+          "expected": "Finance Department",
+          "predicted": "Finance Department",
+          "correct": true
+        },
+        "document_type": {
+          "expected": "report",
+          "predicted": "report",
+          "correct": true
+        }
+      },
+      "document_type": "report"
+    }
+  ]
+}
