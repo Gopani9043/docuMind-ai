@@ -1,8 +1,5 @@
-version: "3.9"
-
 services:
 
-  # ── PostgreSQL Database ──────────────────────────
   postgres:
     image: postgres:15-alpine
     container_name: docparse_postgres
@@ -16,7 +13,6 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
-  # ── MinIO File Storage (local S3) ────────────────
   minio:
     image: minio/minio:latest
     container_name: docparse_minio
@@ -26,12 +22,39 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin123
     ports:
-      - "9000:9000"   # API port
-      - "9001:9001"   # Web dashboard port
+      - "9000:9000"
+      - "9001:9001"
     volumes:
       - minio_data:/data
 
-# ── Named Volumes (data persists here) ──────────────
+  backend:
+    build: ./backend
+    container_name: docparse_backend
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      LLM_MODEL: ${LLM_MODEL}
+      DATABASE_URL: postgresql+asyncpg://docparse:docparse123@postgres:5432/docparse_db
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin123
+      MINIO_BUCKET: docparse-documents
+      MINIO_SECURE: "False"
+    depends_on:
+      - postgres
+      - minio
+
+  frontend:
+    build: ./frontend
+    container_name: docparse_frontend
+    restart: always
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+
 volumes:
   postgres_data:
   minio_data:
