@@ -184,8 +184,7 @@ docparse/
 ├── docker-compose.yml
 └── README.md
 
----
-
+```
 ## Sample Documents
 
 The `sample_documents/` folder contains example PDFs you can use to test the system immediately after setup.
