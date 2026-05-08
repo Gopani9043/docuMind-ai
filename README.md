@@ -47,7 +47,7 @@ DocParse takes any PDF or image document and automatically extracts structured d
 ---
 
 ## Architecture
-    
+
 ```text
 ┌─────────────────────┐      POST /upload       ┌─────────────────────┐
 │   React Frontend    │ ─────────────────────► │   FastAPI Backend   │
@@ -151,9 +151,10 @@ pytest tests/test_ocr.py tests/test_extractor.py tests/test_api.py -v
 
 **13 tests — all passing.**
 
-```text
+
 
 ## Project Structure
+```text
 docparse/
 ├── backend/
 │   ├── database/
