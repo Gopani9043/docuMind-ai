@@ -47,21 +47,37 @@ DocParse takes any PDF or image document and automatically extracts structured d
 ---
 
 ## Architecture
-┌─────────────────┐     POST /upload      ┌──────────────────────┐
-│   React Frontend │ ───────────────────► │   FastAPI Backend     │
-│   localhost:80   │ ◄─────────────────── │   localhost:8000      │
-└─────────────────┘     JSON response     └──────────┬───────────┘
-│
-┌───────────────────────┼───────────────────────┐
-▼                       ▼                       ▼
-┌─────────────────┐   ┌─────────────────┐   ┌────────────────────┐
-│  Tesseract OCR  │   │   Groq LLM      │   │   PostgreSQL       │
-│  pdf → text     │   │   text → JSON   │   │   results storage  │
-└─────────────────┘   └─────────────────┘   └────────────────────┘
-┌────────────────────┐
-│   MinIO S3         │
-│   file storage     │
-└────────────────────┘
+    
+```text
+┌─────────────────────┐      POST /upload       ┌─────────────────────┐
+│   React Frontend    │ ─────────────────────► │   FastAPI Backend   │
+│     localhost:80    │ ◄───────────────────── │    localhost:8000   │
+└─────────────────────┘      JSON Response     └─────────┬───────────┘
+                                                          │
+                    ┌─────────────────────────────────────┼─────────────────────────────────────┐
+                    │                                     │                                     │
+                    ▼                                     ▼                                     ▼
+
+          ┌─────────────────┐                 ┌─────────────────┐                 ┌────────────────────┐
+          │  Tesseract OCR  │                 │    Groq LLM     │                 │    PostgreSQL      │
+          │   PDF → Text    │                 │   Text → JSON   │                 │   Results Storage  │
+          └─────────────────┘                 └─────────────────┘                 └────────────────────┘
+
+                                            ┌────────────────────┐
+                                            │      MinIO S3      │
+                                            │    File Storage    │
+                                            └────────────────────┘
+```
+
+**Services:**
+
+| Service | Technology | Port |
+|---|---|---|
+| Frontend | React + Nginx | 80 |
+| Backend API | FastAPI + Uvicorn | 8000 |
+| Database | PostgreSQL 15 | 5432 |
+| File Storage | MinIO | 9000 |
+| MinIO Dashboard | MinIO Console | 9001 |
 ---
 
 ## Quick Start
@@ -135,7 +151,7 @@ pytest tests/test_ocr.py tests/test_extractor.py tests/test_api.py -v
 
 **13 tests — all passing.**
 
----
+```text
 
 ## Project Structure
 docparse/
