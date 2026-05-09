@@ -1,3 +1,6 @@
+import csv
+import io
+from fastapi.responses import StreamingResponse
 import json
 from pathlib import Path
 import uuid
@@ -244,3 +247,80 @@ async def get_document(
             raise HTTPException(status_code=404, detail="No benchmark data yet. Run tests/benchmark.py first.")
         with open(path) as f:
             return json.load(f)
+
+    @app.post("/batch-upload")
+    async def batch_upload(
+        files: list[UploadFile] = File(...),
+        db: AsyncSession = Depends(get_db)
+    ):
+        """Upload multiple documents at once — returns list of doc_ids."""
+        results = []
+        for file in files:
+            if file.content_type not in ALLOWED_TYPES:
+                results.append({"filename": file.filename, "error": "Unsupported type"})
+                continue
+            file_bytes = await file.read()
+            doc = await crud.create_document(db, file.filename, file.content_type, "")
+            try:
+                s3_key = upload_file(file_bytes, file.filename, file.content_type, str(doc.id))
+                doc.s3_key = s3_key
+                raw_text = extract_text_from_file(file_bytes, file.filename)
+                extraction = extract_structured_data(raw_text)
+                await crud.create_extraction_result(
+                    db, doc.id,
+                    extraction.get("document_type", "unknown"),
+                    extraction.get("extracted_data", {}),
+                    extraction.get("confidence", {}),
+                    raw_text
+                )
+                await crud.update_document_status(db, doc.id, "done")
+                results.append({
+                    "filename": file.filename,
+                    "doc_id": str(doc.id),
+                    "status": "done",
+                    "document_type": extraction.get("document_type")
+                })
+            except Exception as e:
+                await crud.update_document_status(db, doc.id, "error")
+                results.append({"filename": file.filename, "error": str(e)})
+        return {"total": len(files), "results": results} 
+
+@app.get("/export/csv")
+async def export_csv(db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import select
+    from database.models import Document, ExtractionResult
+    from sqlalchemy.orm import selectinload
+
+    result = await db.execute(
+        select(Document).options(selectinload(Document.result))
+        .order_by(Document.created_at.desc())
+    )
+    docs = result.scalars().all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "doc_id", "filename", "status", "document_type",
+        "invoice_number", "vendor_name", "total_amount",
+        "currency", "issue_date", "due_date", "created_at"
+    ])
+    for doc in docs:
+        r = doc.result
+        data = r.extracted_data if r else {}
+        writer.writerow([
+            str(doc.id), doc.filename, doc.status,
+            r.document_type if r else "",
+            data.get("invoice_number", ""),
+            data.get("vendor_name", ""),
+            data.get("total_amount", ""),
+            data.get("currency", ""),
+            data.get("issue_date", ""),
+            data.get("due_date", ""),
+            doc.created_at.strftime("%Y-%m-%d %H:%M")
+        ])
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=docparse_export.csv"}
+    )

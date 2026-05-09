@@ -68,6 +68,32 @@ export default function Upload() {
           onChange={handleChange}
         />
 
+      {/* BATCH UPLOAD */}
+      <div className="mt-6">
+        <label className="block text-sm font-medium text-gray-500 mb-2">
+            Batch upload multiple documents
+        </label>
+        <input
+            type="file"
+            multiple
+            accept=".pdf,.png,.jpg,.jpeg,.tiff"
+            onChange={async (e) => {
+            const files = Array.from(e.target.files)
+            if (!files.length) return
+            const form = new FormData()
+            files.forEach(f => form.append('files', f))
+            try {
+                const { data } = await axios.post(`${API}/batch-upload`, form)
+                alert(`Processed ${data.total} documents successfully!`)
+                window.location.reload()
+            } catch(err) {
+                alert('Batch upload failed')
+            }
+            }}
+            className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-green-50 file:text-green-700 hover:file:bg-green-100 cursor-pointer"
+        />
+        </div>
+        
         {/* Idle state */}
         {status === 'idle' && (
           <>
