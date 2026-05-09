@@ -1,23 +1,18 @@
+import os
 import platform
 import pytesseract
 from pdf2image import convert_from_bytes
 from PIL import Image
 import io
 import logging
-import platform
 
 logger = logging.getLogger(__name__)
 
-# Windows-specific configuration
 if platform.system() == "Windows":
-    pytesseract.pytesseract.tesseract_cmd = (
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    )
-    POPPLER_PATH = r"C:\poppler\poppler-25.12.0\Library\bin"
+    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+    POPPLER_PATH = r'C:\poppler\poppler-25.12.0\Library\bin'
 else:
-    # Linux/macOS use system PATH
-    POPPLER_PATH = None
-
+    POPPLER_PATH = None  # Linux uses system PATH
 
 def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
     try:
@@ -38,30 +33,15 @@ def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
 
 
 def _extract_from_pdf(file_bytes: bytes) -> str:
+    kwargs = {"dpi": 300}
     if POPPLER_PATH:
-        images = convert_from_bytes(
-            file_bytes,
-            dpi=300,
-            poppler_path=POPPLER_PATH
-        )
-    else:
-        images = convert_from_bytes(
-            file_bytes,
-            dpi=300
-        )
-
+        kwargs["poppler_path"] = POPPLER_PATH
+    images = convert_from_bytes(file_bytes, **kwargs)
     all_text = []
-
     for i, image in enumerate(images):
         logger.info(f"Running OCR on page {i+1}/{len(images)}")
-
-        text = pytesseract.image_to_string(
-            image,
-            lang="eng"
-        )
-
+        text = pytesseract.image_to_string(image, lang="eng")
         all_text.append(text)
-
     return "\n\n--- PAGE BREAK ---\n\n".join(all_text)
 
 
