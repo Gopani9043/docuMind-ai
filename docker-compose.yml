@@ -27,6 +27,34 @@ services:
     volumes:
       - minio_data:/data
 
+  redis:
+    image: redis:7-alpine
+    container_name: docparse_redis
+    restart: always
+    ports:
+      - "6379:6379"
+
+  celery_worker:
+    build: ./backend
+    container_name: docparse_celery
+    restart: always
+    command: celery -A celery_app worker --loglevel=info --pool=solo
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      LLM_MODEL: ${LLM_MODEL}
+      DATABASE_URL: postgresql+asyncpg://docparse:docparse123@postgres:5432/docparse_db
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin123
+      MINIO_BUCKET: docparse-documents
+      MINIO_SECURE: "False"
+      REDIS_URL: redis://redis:6379/0
+      TZ: Europe/Berlin
+    depends_on:
+      - postgres
+      - minio
+      - redis
+
   backend:
     build: ./backend
     container_name: docparse_backend
@@ -42,9 +70,11 @@ services:
       MINIO_SECRET_KEY: minioadmin123
       MINIO_BUCKET: docparse-documents
       MINIO_SECURE: "False"
+      REDIS_URL: redis://redis:6379/0
     depends_on:
       - postgres
       - minio
+      - redis
 
   frontend:
     build: ./frontend

@@ -1,0 +1,11 @@
+{
+  "document_type": "invoice",
+  "language": "de",
+  "extracted_data": {
+    "invoice_number": "RE-2024-099",
+    "vendor_name": "Bayern Software GmbH",
+    "total_amount": 3570.00,
+    "currency": "EUR",
+    "vat_amount": 570.00
+  }
+}

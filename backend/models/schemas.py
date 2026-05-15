@@ -52,3 +52,12 @@ class UploadResponse(BaseModel):
     doc_id:  str
     status:  DocumentStatus
     message: str
+class ExtractionResult(BaseModel):
+    doc_id:         str
+    status:         DocumentStatus
+    document_type:  DocumentType
+    extracted_data: Optional[Dict[str, Any]] = None
+    confidence:     Optional[Dict[str, float]] = {}
+    raw_text:       Optional[str] = None
+    error:          Optional[str] = None
+    language:       Optional[str] = "en"    # ← add this line

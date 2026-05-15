@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from dotenv import load_dotenv
 
+from tasks import process_document
 from models.schemas import UploadResponse, ExtractionResult, DocumentStatus
 from services.ocr import extract_text_from_file
 from services.extractor import extract_structured_data
@@ -74,19 +75,16 @@ def health():
 @app.post("/upload", response_model=UploadResponse)
 async def upload_document(
     file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db)   # DB session injected automatically
+    db: AsyncSession = Depends(get_db)
 ):
-    """
-    Upload a document → save to MinIO → OCR → LLM → save to DB → return doc_id
-    """
-    # Step 1: Validate file type
+    # Validate file type
     if file.content_type not in ALLOWED_TYPES:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported file type: {file.content_type}. Use PDF, PNG, JPG or TIFF."
         )
 
-    # Step 2: Read bytes and validate size
+    # Validate file size
     file_bytes = await file.read()
     if len(file_bytes) > MAX_FILE_SIZE:
         raise HTTPException(
@@ -94,68 +92,32 @@ async def upload_document(
             detail="File too large. Maximum size is 20MB."
         )
 
-    # Step 3: Create document record in DB (status = processing)
+    # Create DB record immediately — status = processing
     doc = await crud.create_document(
         db=db,
         filename=file.filename,
         content_type=file.content_type,
-        s3_key=""   # will update after MinIO upload
+        s3_key=""
     )
-    doc_id = doc.id
-    logger.info(f"Created document record: {doc_id}")
+    doc_id = str(doc.id)
+    logger.info(f"Created document: {doc_id}")
 
-    try:
-        # Step 4: Upload original file to MinIO
-        logger.info("Step 1/3: Uploading to MinIO...")
-        s3_key = upload_file(
-            file_bytes=file_bytes,
-            filename=file.filename,
-            content_type=file.content_type,
-            doc_id=str(doc_id)
-        )
-        # Save the s3_key back to the document record
-        doc.s3_key = s3_key
+    # Send to Celery — returns INSTANTLY
+    
+    process_document.delay(
+        file_bytes.hex(),
+        file.filename,
+        file.content_type,
+        doc_id
+    )
 
-        # Step 5: OCR — extract raw text
-        logger.info("Step 2/3: Running OCR...")
-        raw_text = extract_text_from_file(file_bytes, file.filename)
+    # Return immediately without waiting
+    return UploadResponse(
+        doc_id=doc_id,
+        status=DocumentStatus.processing,
+        message="Document queued for processing"
+    )
 
-        # Step 6: LLM — extract structured data
-        logger.info("Step 3/3: Running LLM extraction...")
-        extraction = extract_structured_data(raw_text)
-
-        # Step 7: Save extraction result to DB
-        await crud.create_extraction_result(
-            db=db,
-            doc_id=doc_id,
-            document_type=extraction.get("document_type", "unknown"),
-            extracted_data=extraction.get("extracted_data", {}),
-            confidence=extraction.get("confidence", {}),
-            raw_text=raw_text
-        )
-
-        # Step 8: Update document status to done
-        await crud.update_document_status(db, doc_id, "done")
-        logger.info(f"Document processed successfully: {doc_id}")
-
-        return UploadResponse(
-            doc_id=str(doc_id),
-            status=DocumentStatus.done,
-            message=f"Document processed successfully as {extraction.get('document_type')}"
-        )
-
-    except Exception as e:
-        logger.error(f"Processing failed for {doc_id}: {e}")
-
-        # Save error result so the user knows what went wrong
-        await crud.create_error_result(
-            db=db,
-            doc_id=doc_id,
-            error_message=str(e)
-        )
-        await crud.update_document_status(db, doc_id, "error")
-
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── Get results endpoint ──────────────────────────
