@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
 import Upload from './pages/Upload'
 import Results from './pages/Results'
 import Benchmarks from './pages/Benchmarks.jsx'
+import QA from './pages/QA'
 
 export default function App() {
   return (
@@ -17,6 +18,7 @@ export default function App() {
                 { to: '/',            label: 'Upload'     },
                 { to: '/results',     label: 'Results'    },
                 { to: '/benchmarks',  label: 'Benchmarks' },
+                { to: '/qa',          label: 'Document Q&A' },
               ].map(({ to, label }) => (
                 <NavLink
                   key={to}
@@ -44,6 +46,7 @@ export default function App() {
             <Route path="/results"    element={<Results />} />
             <Route path="/results/:id" element={<Results />} />
             <Route path="/benchmarks" element={<Benchmarks />} />
+            <Route path="/qa"         element={<QA />} />
           </Routes>
         </main>
 

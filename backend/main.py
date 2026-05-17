@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from dotenv import load_dotenv
 
+from pydantic import BaseModel
+from typing import Optional
 from tasks import process_document
 from models.schemas import UploadResponse, ExtractionResult, DocumentStatus
 from services.ocr import extract_text_from_file
@@ -22,6 +24,16 @@ from database import crud
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ── After all imports ─────────────────────────────
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Add QARequest here — before app creation
+class QARequest(BaseModel):
+    question: str
+    doc_id: Optional[str] = None
 
 
 # ── Startup / Shutdown ────────────────────────────
@@ -281,3 +293,52 @@ async def export_csv(db: AsyncSession = Depends(get_db)):
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=docparse_export.csv"}
     )
+
+# ── Q&A endpoints ─────────────────────────────────
+
+class QARequest(BaseModel):
+    question: str
+    doc_id: Optional[str] = None
+
+@app.post("/qa", include_in_schema=True)
+async def question_answer(request: QARequest):
+    """
+    Answer a question.
+    If doc_id provided → RAG on that document.
+    If no doc_id → general knowledge answer.
+    """
+    from services.rag import answer_with_document, answer_general
+
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+    try:
+        if request.doc_id:
+            result = answer_with_document(request.doc_id, request.question)
+        else:
+            result = answer_general(request.question)
+        return result
+
+    except Exception as e:
+        logger.error(f"Q&A failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/qa/index/{doc_id}")
+async def index_document_endpoint(
+    doc_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Manually trigger indexing for an existing document."""
+    from services.rag import index_document
+    try:
+        uid = uuid.UUID(doc_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid document ID")
+
+    doc = await crud.get_document(db, uid)
+    if not doc or not doc.result:
+        raise HTTPException(status_code=404, detail="Document or result not found")
+
+    index_document(doc_id, doc.result.raw_text)
+    return {"message": f"Document {doc_id} indexed successfully"}

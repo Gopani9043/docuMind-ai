@@ -74,6 +74,12 @@ def process_document(self, file_bytes_hex, filename, content_type, doc_id):
             text("UPDATE documents SET status='done' WHERE id=:id"),
             {"id": uid}
         )
+        
+        # Index document for RAG
+        logger.info(f"[{doc_id}] Indexing for RAG...")
+        from services.rag import index_document
+        index_document(doc_id, raw_text)
+        
         db.commit()
         logger.info(f"[{doc_id}] Done!")
 
