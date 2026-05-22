@@ -3,6 +3,7 @@ import logging
 from langchain_groq import ChatGroq
 from langchain.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
+import json
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -35,7 +36,7 @@ Before applying any rewriting rules, check if resolved_context contains
 "intent_override": "show_largest_single_record".
 
 If intent_override is "show_largest_single_record":
-- Rewrite to: "Show the single largest invoice from [vendor_name] ordered by amount descending"
+- Rewrite to: "Show the single largest invoice from [vendor_name] ordered by amount descending limit 1"
 - Always use the vendor_name from resolved_context
 - Never rewrite as closest-to-average
 - Never rewrite as a list query
@@ -71,6 +72,20 @@ STANDALONE_PATTERNS = [
     "show receipts", "show documents"
 ]
 
+# Vague reference indicators — always trigger rewrite
+VAGUE_INDICATORS = [
+    "the highest", "the lowest", "that one", "those", "this one",
+    "that invoice", "that vendor", "that contract", "the same",
+    "compare", "what about", "which ones", "show me more",
+    "that average", "closest", "nearest", "the best", "the worst",
+    "previous", "above mentioned", "it ", "them ", "they ",
+    # ── ADDED: follow-up question patterns ──
+    "which invoice is this", "which one is this", "what is this",
+    "show me the invoice", "show me that", "which one",
+    "when was it", "when was it uploaded", "show related",
+    "is this", "what invoice", "what contract"
+]
+
 
 def rewrite_query(
     question: str,
@@ -84,40 +99,41 @@ def rewrite_query(
     """
     q_lower = question.lower().strip()
 
+    # ── ADDED: Always rewrite if intent_override is set ──
+    intent_override = resolved_context.get("intent_override") if resolved_context else None
+    if intent_override == "show_largest_single_record":
+        vendor = resolved_context.get("vendor_name", "the vendor")
+        rewritten = f"Show the single largest invoice from {vendor} ordered by amount descending limit 1"
+        logger.info(f"Intent override applied: '{question}' → '{rewritten}'")
+        return rewritten
+
     # Skip rewriting for standalone questions
     if any(p in q_lower for p in STANDALONE_PATTERNS):
-        logger.info(f"Standalone question — no rewrite needed")
+        logger.info("Standalone question — no rewrite needed")
         return question
 
     # Skip if no history
     if not history:
         return question
 
-    # Vague reference indicators
-    vague_indicators = [
-        "the highest", "the lowest", "that one", "those", "this one",
-        "that invoice", "that vendor", "that contract", "the same",
-        "compare", "what about", "which ones", "show me more",
-        "that average", "closest", "nearest", "the best", "the worst",
-        "previous", "above mentioned", "it ", "them ", "they "
-    ]
-
-    needs_rewrite = any(ind in q_lower for ind in vague_indicators)
+    needs_rewrite = any(ind in q_lower for ind in VAGUE_INDICATORS)
 
     if not needs_rewrite:
         return question
 
     try:
+        # ── FIXED: No truncation on resolved_context ──
+        context_str = json.dumps(resolved_context) if resolved_context else "{}"
+
         chain = REWRITE_PROMPT | llm
         result = chain.invoke({
             "question": question,
             "history": history,
             "last_results": str(last_metadata.get("results_sample", []))[:400],
-            "resolved_context": str(resolved_context)[:400]
+            "resolved_context": context_str
         })
         rewritten = result.content.strip()
 
-        # Sanity check — if rewritten is too different or empty, use original
         if not rewritten or len(rewritten) < 5:
             return question
 
