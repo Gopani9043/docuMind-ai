@@ -110,6 +110,19 @@ SELECT d.filename, r.extracted_data->>'vendor_name' as vendor, NULLIF(REPLACE(r.
 -- Processing status summary
 SELECT status, COUNT(*) as count, ROUND(COUNT(*)*100.0/SUM(COUNT(*))OVER(), 1) as percentage FROM documents GROUP BY status ORDER BY count DESC;
 
+-- Largest single invoice from a specific vendor
+SELECT d.filename,
+       r.extracted_data->>'vendor_name' AS vendor,
+       NULLIF(REPLACE(r.extracted_data->>'total_amount',',',''),'')::numeric AS amount,
+       r.extracted_data->>'currency' AS currency,
+       r.extracted_data->>'issue_date' AS issue_date
+FROM documents d
+JOIN extraction_results r ON r.doc_id = d.id
+WHERE r.document_type = 'invoice'
+  AND d.status = 'done'
+  AND LOWER(r.extracted_data->>'vendor_name') = LOWER('BrightPath Analytics')
+ORDER BY amount DESC NULLS LAST
+LIMIT 1;
 
 Return ONLY the SQL query. No explanation. No markdown. No backticks.
 
