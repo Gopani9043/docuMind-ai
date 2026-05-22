@@ -342,3 +342,42 @@ async def index_document_endpoint(
 
     index_document(doc_id, doc.result.raw_text)
     return {"message": f"Document {doc_id} indexed successfully"}
+
+@app.post("/smart-chat")
+async def smart_chat_endpoint(
+    request: QARequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Smart conversational chatbot with memory, context and orchestration."""
+    from chatbot.orchestrator import process_message
+
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+    session_id = request.doc_id or "global"
+
+    try:
+        result = await process_message(
+            question=request.question.strip(),
+            session_id=session_id,
+            db=db
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Smart chat failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/smart-chat/session/{session_id}")
+async def clear_chat_session(session_id: str):
+    """Clear conversation memory."""
+    from chatbot.memory_manager import clear_session
+    clear_session(session_id)
+    return {"message": f"Session {session_id} cleared"}
+
+
+@app.get("/smart-chat/history/{session_id}")
+async def get_chat_history(session_id: str):
+    """Get conversation history."""
+    from chatbot.memory_manager import get_history
+    return {"history": get_history(session_id)}

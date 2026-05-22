@@ -17,6 +17,9 @@ dist/
 # Docker
 *.log
 
+# Vector stores
+backend/vector_stores/
+
 # OS
 .DS_Store
 Thumbs.db

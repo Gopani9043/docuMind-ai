@@ -25,25 +25,24 @@ llm = ChatGroq(
 VECTOR_STORE_DIR = Path(__file__).parent.parent / "vector_stores"
 VECTOR_STORE_DIR.mkdir(exist_ok=True)
 
-# ── Prompts ───────────────────────────────────────
-DOCUMENT_QA_PROMPT = ChatPromptTemplate.from_template("""
-You are a helpful document assistant.
-Answer the question based ONLY on the document context below.
-If the answer is not in the context, say "I could not find this information in the document."
-Always mention which part of the document your answer comes from.
-
-DOCUMENT CONTEXT:
-{context}
+GENERAL_QA_PROMPT = ChatPromptTemplate.from_template("""
+You are a helpful assistant for document processing.
+Answer the following question clearly and concisely.
 
 QUESTION:
 {question}
 
-Answer clearly and concisely:
+Answer:
 """)
 
-GENERAL_QA_PROMPT = ChatPromptTemplate.from_template("""
-You are a helpful assistant for document processing.
-Answer the following question clearly and concisely.
+# ── Prompts ───────────────────────────────────────
+DOCUMENT_QA_PROMPT = ChatPromptTemplate.from_template("""
+You are a helpful document assistant.
+Answer the question based ONLY on the document context below.
+Answer in one clear sentence. No brackets, no source references, no explanations.
+
+DOCUMENT CONTEXT:
+{context}
 
 QUESTION:
 {question}
@@ -154,7 +153,6 @@ def answer_with_document(doc_id: str, question: str) -> dict:
 
 def answer_general(question: str) -> dict:
     """Answer a general question without document context."""
-    chain = DOCUMENT_QA_PROMPT | llm
     chain = GENERAL_QA_PROMPT | llm
     response = chain.invoke({"question": question})
     return {
