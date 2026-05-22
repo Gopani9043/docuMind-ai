@@ -27,6 +27,27 @@ LAST QUERY RESULTS SUMMARY:
 CURRENT QUESTION:
 {question}
 
+CRITICAL RESOLUTION RULES — always apply these before extracting context:
+
+1. If the previous query was an AGGREGATION (total, sum, count, average, top vendor, highest spending)
+   AND the current question is "which invoice is this?" or "show me the invoice" or "which one is this?"
+   or "what is it?" or "show me that" or "which one?" →
+   ALWAYS resolve to: the largest single record from the previously mentioned vendor/type.
+   Set intent_override to "show_largest_single_record".
+   NEVER interpret this as closest-to-average.
+
+2. "which one is this" / "which one" / "that one" after an aggregation result →
+   means the top individual record by amount DESC, not closest to average.
+
+3. "which invoice is this" after a vendor total query →
+   means the largest single invoice from that vendor ORDER BY amount DESC LIMIT 1.
+
+4. "show me the invoice" / "show me that invoice" / "what invoice" →
+   largest invoice from the vendor in context, not a search or average match.
+
+5. Only use closest-to-average logic when user explicitly says
+   "closest to", "nearest to", "around", "approximately".
+
 Extract and return a JSON object with these fields:
 {{
   "document_type": "invoice|contract|receipt|report|null",
@@ -35,8 +56,9 @@ Extract and return a JSON object with these fields:
   "amount_reference": "specific amount referenced like 43482 or null",
   "time_period": "this month|last month|this week|null",
   "comparison_requested": true or false,
-  "previous_query_type": "what the previous query was about or null",
-  "resolved_references": "what vague terms like this/that/those refer to"
+  "previous_query_type": "aggregation|single_record|list|null",
+  "intent_override": "show_largest_single_record|null",
+  "resolved_references": "what vague terms like this/that/those refer to — be specific, name the actual vendor/document/amount"
 }}
 
 Return ONLY valid JSON. No explanation.
