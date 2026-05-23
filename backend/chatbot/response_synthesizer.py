@@ -27,6 +27,13 @@ RULES:
 - If no data: say "No results found." and suggest one reason
 - For comparisons: state the winner first, then the difference
 - Lead with the most important number or insight
+- If question starts with "show", "list", "display", "give me all" → 
+  return a structured list of results, not a paragraph summary
+- For list queries with more than 5 results → show first 5 with format:
+  1. filename | vendor | amount | currency
+  2. ...
+  and end with "... and X more results"
+- Never summarize a list query into a paragraph
 
 CONVERSATION HISTORY:
 {history}
