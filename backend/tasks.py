@@ -15,6 +15,14 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+# ── Pre-load SentenceTransformer on worker startup ──
+# This runs once when Celery starts, not on every task
+# Prevents 2-minute delay on first document
+logger.info("Pre-loading SentenceTransformer model...")
+from sentence_transformers import SentenceTransformer
+_preloaded_model = SentenceTransformer('all-MiniLM-L6-v2')
+logger.info("SentenceTransformer model ready.")
+
 # Use SYNC database connection for Celery (not async)
 SYNC_DB_URL = os.getenv(
     "DATABASE_URL",
@@ -74,12 +82,12 @@ def process_document(self, file_bytes_hex, filename, content_type, doc_id):
             text("UPDATE documents SET status='done' WHERE id=:id"),
             {"id": uid}
         )
-        
+
         # Index document for RAG
         logger.info(f"[{doc_id}] Indexing for RAG...")
         from services.rag import index_document
         index_document(doc_id, raw_text)
-        
+
         db.commit()
         logger.info(f"[{doc_id}] Done!")
 

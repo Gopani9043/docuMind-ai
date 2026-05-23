@@ -49,6 +49,9 @@ services:
       MINIO_BUCKET: docparse-documents
       MINIO_SECURE: "False"
       REDIS_URL: redis://redis:6379/0
+      # ── ADDED: Redis memory for chatbot ──
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
       TZ: Europe/Berlin
     depends_on:
       - postgres
@@ -71,10 +74,15 @@ services:
       MINIO_BUCKET: docparse-documents
       MINIO_SECURE: "False"
       REDIS_URL: redis://redis:6379/0
+      # ── ADDED: Redis memory for chatbot ──
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
     depends_on:
       - postgres
       - minio
       - redis
+      # ── ADDED: backend waits for celery ──
+      - celery_worker
 
   frontend:
     build: ./frontend
