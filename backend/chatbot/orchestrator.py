@@ -18,7 +18,7 @@ from chatbot.response_synthesizer import (
     synthesize_response, synthesize_error, synthesize_general
 )
 from services.anomaly_detector import detect_outliers, detect_duplicates
-from services.vendor_matcher import find_matches, normalize
+from services.vendor_matcher import find_matches, normalize, find_similar_vendors
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,7 @@ async def process_message(
     1.  Load memory context
     2.  Classify intent
     3.  Handle reset / greeting / general / clarification
+    3d. Handle vendor fuzzy matching
     4.  Check complexity — decompose if needed
     5.  Resolve context (vague references)
     6.  Rewrite query
@@ -181,6 +182,52 @@ async def process_message(
             "results": [],
             "count": 0
         }
+
+    # ── Step 3d: Handle vendor fuzzy matching ─────
+    fuzzy_keywords = [
+        "slightly different", "similar spelling", "same vendor",
+        "duplicate vendor", "vendor variations", "similar vendors",
+        "vendor spelling", "same company", "vendor duplicates"
+    ]
+    if any(kw in question.lower() for kw in fuzzy_keywords):
+        logger.info(f"[{session_id}] Vendor fuzzy matching triggered")
+        fuzzy_sql = """
+            SELECT DISTINCT r.extracted_data->>'vendor_name' as vendor
+            FROM documents d
+            JOIN extraction_results r ON r.doc_id = d.id
+            WHERE d.status = 'done'
+            AND r.extracted_data->>'vendor_name' IS NOT NULL
+            LIMIT 200
+        """
+        is_valid, _ = validate_sql(fuzzy_sql)
+        if is_valid:
+            try:
+                all_vendors_data = await execute_query(fuzzy_sql, db)
+                all_vendors = [v["vendor"] for v in all_vendors_data if v["vendor"]]
+                groups = find_similar_vendors(all_vendors)
+                if groups:
+                    lines = ["These vendors may be the same entity:\n"]
+                    for group in groups:
+                        lines.append(f"• {' / '.join(group)}")
+                    answer = "\n".join(lines)
+                else:
+                    answer = "No similar vendor spellings found. All vendor names appear unique."
+                save_turn(session_id, "assistant", answer, {
+                    "intent": "vendor_fuzzy",
+                    "sql": fuzzy_sql,
+                    "count": len(all_vendors_data)
+                })
+                return {
+                    "answer": answer,
+                    "intent": "vendor_fuzzy",
+                    "session_id": session_id,
+                    "rewritten": None,
+                    "sql": fuzzy_sql,
+                    "results": all_vendors_data,
+                    "count": len(all_vendors_data)
+                }
+            except Exception as e:
+                logger.error(f"[{session_id}] Vendor fuzzy matching failed: {e}", exc_info=True)
 
     # ── Step 4: Decompose if complex ─────────────
     if is_complex_question(question):
