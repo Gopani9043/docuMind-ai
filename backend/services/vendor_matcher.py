@@ -43,3 +43,33 @@ def find_matches(
             matches.append(v)
     logger.info(f"Vendor '{vendor}' matched: {matches}")
     return matches
+
+
+def find_similar_vendors(vendors: list) -> list:
+    """Group vendors that are likely the same entity."""
+    used = set()
+    groups = []
+
+    for i, v1 in enumerate(vendors):
+        if v1 in used:
+            continue
+        group = [v1]
+        n1 = normalize(v1)
+        for v2 in vendors[i + 1:]:
+            if v2 in used:
+                continue
+            n2 = normalize(v2)
+            if not n1 or not n2:
+                continue
+            # FIX 2: SequenceMatcher directly on pre-normalized strings
+            score = SequenceMatcher(None, n1, n2).ratio()
+            if score >= 0.75:
+                group.append(v2)
+                used.add(v2)
+        if len(group) > 1:
+            used.add(v1)
+            groups.append(group)
+
+    # FIX 1: logger outside loop — logs only once
+    logger.info(f"Vendor groups found: {len(groups)}")
+    return groups
