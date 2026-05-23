@@ -60,11 +60,12 @@ def classify_intent(question: str, history: str = "") -> str:
 
     # SQL keywords
     sql_keywords = [
-        "show", "list", "find", "get", "how many", "total", "sum",
-        "average", "top", "highest", "lowest", "compare", "filter",
-        "invoice", "contract", "receipt", "vendor", "amount", "currency",
-        "overdue", "expiring", "missing", "uploaded", "this month",
-        "last month", "this week", "trend", "breakdown", "distribution"
+    "show", "list", "find", "get", "how many", "total", "sum",
+    "average", "top", "highest", "lowest", "compare", "filter",
+    "invoice", "contract", "receipt", "vendor", "amount", "currency",
+    "overdue", "expiring", "missing", "uploaded", "this month",
+    "last month", "this week", "trend", "breakdown", "distribution",
+    "spelling", "duplicate", "similar", "fuzzy", "suspicious", "anomaly"  # ← add these
     ]
     if any(kw in q_lower for kw in sql_keywords):
         return "sql_analytics"
