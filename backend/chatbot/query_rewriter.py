@@ -1,9 +1,9 @@
 import os
+import json
 import logging
 from langchain_groq import ChatGroq
 from langchain.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
-import json
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -32,31 +32,45 @@ CURRENT QUESTION:
 {question}
 
 CRITICAL — CHECK INTENT OVERRIDE FIRST:
-Before applying any rewriting rules, check if resolved_context contains
-"intent_override": "show_largest_single_record".
+Before applying any rewriting rules, check resolved_context for intent_override.
+
+If intent_override is "duplicate_followup":
+- Previous query was about duplicate invoices
+- "how many times" → "How many times does [invoice] from [vendor] appear?"
+- "show them" → "Show all duplicate invoices"
+- "which one is newest" → "Which duplicate invoice was uploaded most recently?"
+- "give me vendor name" → "What is the vendor name of the most repeated invoice?"
+
+If intent_override is "repetition_count":
+- Return exactly: "How many times does the most repeated invoice appear?"
+
+If intent_override is "list_navigation":
+- "the second one" → use last_results[1] directly, no SQL needed
+- "the third one" → use last_results[2] directly
 
 If intent_override is "show_largest_single_record":
-- Rewrite to: "Show the single largest invoice from [vendor_name] ordered by amount descending limit 1"
-- Always use the vendor_name from resolved_context
-- Never rewrite as closest-to-average
-- Never rewrite as a list query
-- This overrides ALL other rules below
+- ONLY apply when conversation_focus is NOT duplicate_invoices
+- ONLY apply when NO duplicate context exists in history
+- Rewrite to: "Show the single largest invoice from [vendor] ordered by amount descending limit 1"
 
 REWRITING RULES:
-- "the highest one" → "show the invoice with highest amount from previous results"
-- "those invoices" → "show invoices [with same filters as previous query]"
-- "that vendor" → "show documents from [vendor name from previous result]"
-- "compare with last month" → "compare [previous query subject] this month vs last month"
-- "what about contracts" → "show same analysis but for contracts instead"
-- "which ones are overdue" → "show overdue invoices [from previous filters]"
+- "the highest one" → "show the invoice with highest amount"
+- "those invoices" → "show invoices with same filters as previous query"
+- "that vendor" → "show documents from [vendor from previous result]"
+- "compare with last month" → "compare previous subject this month vs last month"
+- "what about contracts" → "show same analysis but for contracts"
+- "which ones are overdue" → "show overdue invoices from previous filters"
 - "show me more" → "show more results from previous query"
-- "that average" → "use the average value [X] from previous answer"
-- "the closest one" → "find the invoice closest to [amount from previous answer]"
-- "which invoice is this" + context has vendor → "Show the largest single invoice from [vendor] ordered by amount descending limit 1"
-- "show me the invoice" after total query → "Show the largest single invoice from [vendor] ordered by amount descending limit 1"
-- "which one" after aggregation → "Show the top individual record by amount descending limit 1"
-- "when was it uploaded" + context has vendor → "Show filename and created_at for the largest invoice from [vendor]"
+- "that average" → "use the average value from previous answer"
+- "the closest one" → "find the invoice closest to amount from previous answer"
+- "which invoice is this" + duplicate context → "What is the most repeated invoice?"
+- "which invoice is this" + NO duplicate context + has vendor → "Show largest invoice from [vendor] ordered by amount descending limit 1"
+- "show me the invoice" + duplicate context → "Show all duplicate invoices"
+- "which one" + duplicate context → "Which invoice repeats most?"
+- "which one" + NO duplicate context → "Show top record by amount descending limit 1"
+- "when was it uploaded" + context has vendor → "Show filename and created_at for [vendor] invoice"
 - "show related contracts" + context has vendor → "Show contracts where parties contains [vendor]"
+- "give me vendor name" + duplicate context → "What is the vendor of the most repeated invoice?"
 - If question is already clear and specific → return it unchanged
 
 Return ONLY the rewritten question. No explanation. No quotes. No markdown.
@@ -79,12 +93,20 @@ VAGUE_INDICATORS = [
     "compare", "what about", "which ones", "show me more",
     "that average", "closest", "nearest", "the best", "the worst",
     "previous", "above mentioned", "it ", "them ", "they ",
-    # ── ADDED: follow-up question patterns ──
     "which invoice is this", "which one is this", "what is this",
     "show me the invoice", "show me that", "which one",
     "when was it", "when was it uploaded", "show related",
-    "is this", "what invoice", "what contract"
-]
+    "is this", "what invoice", "what contract",
+    "how many times", "repeat", "how often", "appear",
+    "the second", "the third", "next one", "previous one",
+    "show them", "list them", "what currency", "how much",
+    "newest", "oldest", "latest", "earliest",
+    "give me", "vendor name", "this invoice", "this vendor",
+    "only ", "just ", "from them", "show all from",
+    "their invoices", "their contracts", "all from",
+    "from that vendor", "from same vendor"
+
+]   
 
 
 def rewrite_query(
@@ -98,14 +120,24 @@ def rewrite_query(
     Returns original question if already clear.
     """
     q_lower = question.lower().strip()
-
-    # ── ADDED: Always rewrite if intent_override is set ──
     intent_override = resolved_context.get("intent_override") if resolved_context else None
-    if intent_override == "show_largest_single_record":
+    conversation_focus = resolved_context.get("conversation_focus", "") or ""
+
+    # ── Check duplicate focus BEFORE any override ──
+    is_duplicate_focus = any(k in str(conversation_focus).lower() for k in
+                             ["duplicate", "repeat", "duplicate_invoices"])
+
+    # ── show_largest_single_record ONLY when NOT in duplicate context ──
+    if intent_override == "show_largest_single_record" and not is_duplicate_focus:
         vendor = resolved_context.get("vendor_name", "the vendor")
         rewritten = f"Show the single largest invoice from {vendor} ordered by amount descending limit 1"
         logger.info(f"Intent override applied: '{question}' → '{rewritten}'")
         return rewritten
+
+    # ── If in duplicate focus, block show_largest and handle directly ──
+    if is_duplicate_focus and intent_override == "show_largest_single_record":
+        logger.info("Blocked show_largest_single_record — duplicate focus active")
+        # Fall through to LLM rewriting with duplicate context
 
     # Skip rewriting for standalone questions
     if any(p in q_lower for p in STANDALONE_PATTERNS):
@@ -122,7 +154,6 @@ def rewrite_query(
         return question
 
     try:
-        # ── FIXED: No truncation on resolved_context ──
         context_str = json.dumps(resolved_context) if resolved_context else "{}"
 
         chain = REWRITE_PROMPT | llm
