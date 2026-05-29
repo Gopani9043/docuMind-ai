@@ -4,7 +4,6 @@ import numpy as np
 import faiss
 import pickle
 from pathlib import Path
-from sentence_transformers import SentenceTransformer
 from langchain_groq import ChatGroq
 from langchain.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
@@ -12,8 +11,22 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# ── Models ────────────────────────────────────────
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+# ── Lazy model loader — only loads when first needed ──────────────────────────
+_embedder = None
+
+def get_embedder():
+    """
+    Load SentenceTransformer only when actually needed.
+    Never loads on import — fixes backend startup hang.
+    """
+    global _embedder
+    if _embedder is None:
+        from sentence_transformers import SentenceTransformer
+        logger.info("Loading SentenceTransformer model...")
+        _embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        logger.info("SentenceTransformer model loaded.")
+    return _embedder
+
 
 llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY"),
@@ -35,7 +48,6 @@ QUESTION:
 Answer:
 """)
 
-# ── Prompts ───────────────────────────────────────
 DOCUMENT_QA_PROMPT = ChatPromptTemplate.from_template("""
 You are a helpful document assistant.
 Answer the question based ONLY on the document context below.
@@ -51,7 +63,7 @@ Answer:
 """)
 
 
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list:
     """Split text into overlapping chunks for better context."""
     words = text.split()
     chunks = []
@@ -66,7 +78,7 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]
 def index_document(doc_id: str, raw_text: str) -> None:
     """
     Convert document text to vectors and save FAISS index.
-    Called after OCR extraction.
+    Called after OCR extraction — runs in Celery worker, not backend.
     """
     try:
         chunks = chunk_text(raw_text)
@@ -75,19 +87,19 @@ def index_document(doc_id: str, raw_text: str) -> None:
             return
 
         logger.info(f"Indexing {len(chunks)} chunks for doc {doc_id}")
+
+        # ── Use lazy loader — model only loads here in Celery ──
+        embedder = get_embedder()
         embeddings = embedder.encode(chunks, show_progress_bar=False)
         embeddings = np.array(embeddings).astype("float32")
 
-        # Normalize for cosine similarity
         faiss.normalize_L2(embeddings)
 
-        # Create FAISS index
         dim = embeddings.shape[1]
         index = faiss.IndexFlatIP(dim)
         index.add(embeddings)
 
-        # Save index and chunks
-        index_path = VECTOR_STORE_DIR / f"{doc_id}.index"
+        index_path  = VECTOR_STORE_DIR / f"{doc_id}.index"
         chunks_path = VECTOR_STORE_DIR / f"{doc_id}.chunks"
 
         faiss.write_index(index, str(index_path))
@@ -101,7 +113,7 @@ def index_document(doc_id: str, raw_text: str) -> None:
         raise
 
 
-def search_document(doc_id: str, query: str, top_k: int = 3) -> list[str]:
+def search_document(doc_id: str, query: str, top_k: int = 3) -> list:
     """Search for relevant chunks in a document."""
     index_path  = VECTOR_STORE_DIR / f"{doc_id}.index"
     chunks_path = VECTOR_STORE_DIR / f"{doc_id}.chunks"
@@ -113,6 +125,8 @@ def search_document(doc_id: str, query: str, top_k: int = 3) -> list[str]:
     with open(chunks_path, "rb") as f:
         chunks = pickle.load(f)
 
+    # ── Use lazy loader ──
+    embedder = get_embedder()
     query_vec = embedder.encode([query]).astype("float32")
     faiss.normalize_L2(query_vec)
 
