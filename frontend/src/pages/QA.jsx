@@ -30,17 +30,68 @@ const UserAvatar = () => (
   </div>
 )
 
-export default function QA() {
-  const [docs, setDocs]            = useState([])
-  const [selectedDoc, setSelected] = useState(null)
-  const [messages, setMessages]    = useState([])
-  const [question, setQuestion]    = useState('')
-  const [loading, setLoading]      = useState(false)
-  const [mode, setMode]            = useState('document')
-  const bottomRef                  = useRef(null)
+// ── localStorage helpers ──
+const loadMessages = (key) => {
+  try {
+    const saved = localStorage.getItem(key)
+    return saved ? JSON.parse(saved) : []
+  } catch { return [] }
+}
 
-  // ── CHANGE 1: Session ID ──
-  const [sessionId] = useState(() => `session_${Date.now()}`)
+const saveMessages = (key, messages) => {
+  try {
+    // Only save last 50 messages to avoid localStorage limit
+    localStorage.setItem(key, JSON.stringify(messages.slice(-50)))
+  } catch {}
+}
+
+const SMART_MESSAGES_KEY  = 'docmind_smart_messages'
+const DOC_MESSAGES_KEY    = 'docmind_doc_messages'
+
+export default function QA() {
+  const [docs, setDocs]         = useState([])
+  const [selectedDoc, setSelected] = useState(null)
+  const [question, setQuestion] = useState('')
+  const [loading, setLoading]   = useState(false)
+  const [mode, setMode]         = useState(() => {
+    return localStorage.getItem('docmind_mode') || 'document'
+  })
+  const bottomRef = useRef(null)
+
+  // ── Persistent session ID ──
+  const [sessionId] = useState(() => {
+    const existing = localStorage.getItem('docmind_session_id')
+    if (existing) return existing
+    const newId = `session_${Date.now()}`
+    localStorage.setItem('docmind_session_id', newId)
+    return newId
+  })
+
+  // ── Separate message history per mode ──
+  const [smartMessages, setSmartMessages] = useState(() =>
+    loadMessages(SMART_MESSAGES_KEY)
+  )
+  const [docMessages, setDocMessages] = useState(() =>
+    loadMessages(DOC_MESSAGES_KEY)
+  )
+
+  // Current messages based on mode
+  const messages = mode === 'smart' ? smartMessages : docMessages
+  const setMessages = (updater) => {
+    if (mode === 'smart') {
+      setSmartMessages(prev => {
+        const next = typeof updater === 'function' ? updater(prev) : updater
+        saveMessages(SMART_MESSAGES_KEY, next)
+        return next
+      })
+    } else {
+      setDocMessages(prev => {
+        const next = typeof updater === 'function' ? updater(prev) : updater
+        saveMessages(DOC_MESSAGES_KEY, next)
+        return next
+      })
+    }
+  }
 
   useEffect(() => {
     axios.get(`${API}/documents`)
@@ -52,10 +103,21 @@ export default function QA() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  // Save mode to localStorage when it changes
+  useEffect(() => {
+    localStorage.setItem('docmind_mode', mode)
+  }, [mode])
+
   function handleDocChange(e) {
     const doc = docs.find(d => d.doc_id === e.target.value) || null
     setSelected(doc)
-    setMessages([{
+    setDocMessages([{
+      role: 'ai',
+      text: doc
+        ? `I have loaded ${doc.filename}. Ask me anything about this document!`
+        : 'No document selected. Ask me any general question.'
+    }])
+    saveMessages(DOC_MESSAGES_KEY, [{
       role: 'ai',
       text: doc
         ? `I have loaded ${doc.filename}. Ask me anything about this document!`
@@ -66,12 +128,7 @@ export default function QA() {
   function handleModeChange(newMode) {
     setMode(newMode)
     setSelected(null)
-    setMessages([{
-      role: 'ai',
-      text: newMode === 'smart'
-        ? 'Smart mode active! Ask me things like "show all invoices above EUR 1000" or "which vendor did I pay the most?"'
-        : 'Document mode active. Select a document and ask questions about it.'
-    }])
+    // Do NOT clear messages — restore from localStorage automatically
   }
 
   async function sendQuestion() {
@@ -85,14 +142,12 @@ export default function QA() {
       let data
 
       if (mode === 'smart') {
-        // ── CHANGE 2: Updated smart mode with decomposition notice ──
         const res = await axios.post(`${API}/smart-chat`, {
           question: q,
           doc_id: sessionId
         })
         data = res.data
 
-        // Show rewritten query if different
         if (data.rewritten) {
           setMessages(prev => [...prev, {
             role: 'system',
@@ -100,7 +155,6 @@ export default function QA() {
           }])
         }
 
-        // Show decomposition notice
         if (data.decomposed) {
           setMessages(prev => [...prev, {
             role: 'system',
@@ -140,6 +194,25 @@ export default function QA() {
 
   function handleKey(e) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendQuestion() }
+  }
+
+  // ── Clear chat for smart mode ──
+  async function handleClearChat() {
+    try {
+      await axios.delete(`${API}/smart-chat/session/${sessionId}`)
+    } catch(e) {}
+    localStorage.removeItem('docmind_session_id')
+    localStorage.removeItem(SMART_MESSAGES_KEY)
+    const newId = `session_${Date.now()}`
+    localStorage.setItem('docmind_session_id', newId)
+    setSmartMessages([{
+      role: 'ai',
+      text: 'Conversation cleared! What would you like to know?'
+    }])
+    saveMessages(SMART_MESSAGES_KEY, [{
+      role: 'ai',
+      text: 'Conversation cleared! What would you like to know?'
+    }])
   }
 
   const documentSuggestions = selectedDoc
@@ -186,16 +259,9 @@ export default function QA() {
           🧠 Smart Chat
         </button>
 
-        {/* ── CHANGE 3: Clear Chat button ── */}
         {mode === 'smart' && (
           <button
-            onClick={async () => {
-              await axios.delete(`${API}/smart-chat/session/${sessionId}`)
-              setMessages([{
-                role: 'ai',
-                text: 'Conversation cleared! What would you like to know?'
-              }])
-            }}
+            onClick={handleClearChat}
             className="text-xs text-gray-400 hover:text-red-500 transition-colors"
           >
             Clear chat
@@ -214,7 +280,6 @@ export default function QA() {
         {/* LEFT PANEL */}
         <div className="flex flex-col gap-4">
 
-          {/* Document selector — only in document mode */}
           {mode === 'document' && (
             <div>
               <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
@@ -232,7 +297,6 @@ export default function QA() {
             </div>
           )}
 
-          {/* Smart mode info */}
           {mode === 'smart' && (
             <div className="bg-green-50 border border-green-200 rounded-lg p-3">
               <p className="text-xs font-semibold text-green-700 mb-1">🧠 Smart Chat</p>
@@ -252,7 +316,6 @@ export default function QA() {
             </div>
           )}
 
-          {/* Suggestions */}
           <div>
             <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
               {mode === 'smart' ? 'Example queries' : 'Suggested questions'}

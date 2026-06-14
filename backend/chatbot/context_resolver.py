@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY"),
-    model_name=os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
+    model_name=os.getenv("LLM_MODEL", "llama-3.1-8b-instant"),
     temperature=0,
 )
 
@@ -167,18 +167,24 @@ def resolve_context(
 
     if actual_results:
         first = actual_results[0]
-        # Extract vendor — normalize for fuzzy matching
         raw_vendor = first.get("vendor") or first.get("vendor_name")
         if raw_vendor:
-            default_context["vendor_name"] = raw_vendor  # keep original for SQL matching
-
-        # Extract currency
+            default_context["vendor_name"] = raw_vendor
         if first.get("currency"):
             default_context["currency"] = first["currency"]
-
-        # Extract amount
         if first.get("amount"):
             default_context["amount_reference"] = str(first["amount"])
+
+    # ── Carry forward active filters from conversation focus ──────────────────
+    # This ensures "smallest one" after "above 10000 EUR" keeps all filters
+    if conversation_focus:
+        if not default_context["vendor_name"] and conversation_focus.get("vendor"):
+            default_context["vendor_name"] = conversation_focus["vendor"]
+        if not default_context["currency"] and conversation_focus.get("currency"):
+            default_context["currency"] = conversation_focus["currency"]
+        # Carry forward amount threshold only for filter queries, not absolute amounts
+        if conversation_focus.get("amount_threshold"):
+            default_context["amount_threshold"] = conversation_focus["amount_threshold"]
 
     # ── Fast path: repetition count — no LLM needed ──────────────────────────
     # Universal: works for any duplicate group, any vendor
@@ -195,11 +201,22 @@ def resolve_context(
 
     # Never use list_navigation if question has filter keywords — it is a new query
     q_lower = question.lower().strip()
+    # ── Pre-compute once — used in multiple places ──
     has_filter_keywords = any(k in q_lower for k in [
         "above ", "below ", "more than", "less than",
-        "above 1", "above 5", "above 10",
         "this month", "last month", "show invoices",
-        "show contracts", "find invoices", "list invoices"
+        "show contracts", "find invoices", "list invoices",
+        "show me all", "list all", "show all",
+        "compare the", "compare top", "top two", "top three",
+        "risky", "suspicious ones", "only the", "show only",
+        "related invoices", "related contracts",
+        "convert", "mentally",
+        "smallest", "largest", "cheapest", "most expensive",
+        "highest amount", "lowest amount", "newest", "oldest",
+        "latest", "earliest", "most recent",
+        "which currency", "highest currency", "currency total",
+        "total eur", "total usd", "total spending",
+        "which month", "highest month", "month total"
     ])
 
     if any(term in q_lower for term in navigation_terms) and actual_results and not has_filter_keywords:
@@ -213,6 +230,27 @@ def resolve_context(
 
     needs_llm = any(term in q_lower for term in VAGUE_TERMS)
     if not needs_llm:
+        return default_context
+ 
+    # ── Fast path: fresh analytical queries — never list_navigation ──────────
+    # These always need a new SQL query, never navigate a cached list
+    fresh_query_patterns = [
+        "show the", "show me the", "list the", "find the", "get the",
+        "most expensive", "cheapest", "lowest", "highest amount",
+        "newest", "oldest", "latest", "earliest", "most recent",
+        "top ", "bottom ", "first ", "last ", "all invoices",
+        "all contracts", "all receipts", "10 most", "5 most",
+        "10 cheapest", "5 cheapest", "10 largest", "5 largest",
+    ]
+    is_fresh_query = any(p in q_lower for p in fresh_query_patterns)
+
+    # If it looks like a fresh analytical query and not a positional reference
+    # ("the second one", "the third item"), skip LLM and return clean context
+    positional_terms = ["the second", "the third", "the fourth", "the fifth", "item "]
+    is_positional = any(p in q_lower for p in positional_terms)
+
+    if is_fresh_query and not is_positional:
+        logger.info("Fast path: fresh query detected — skipping LLM context resolution")
         return default_context
 
     # ── LLM resolution for complex vague references ───────────────────────────
@@ -267,11 +305,45 @@ def resolve_context(
         has_filter_keywords = any(k in q_lower for k in [
             "above ", "below ", "more than", "less than",
             "this month", "last month", "show invoices",
-            "show contracts", "find invoices", "list invoices"
+            "show contracts", "find invoices", "list invoices",
+            "show me all", "list all", "show all",
+            "compare the", "compare top", "top two", "top three",
+            "risky", "suspicious ones", "only the", "show only",
+            "related invoices", "related contracts",
+            "convert", "mentally","which currency", "currency has", "highest currency",
+            "currency total", "by currency", "currency breakdown",
         ])
+        # Block list_navigation for filter queries
         if has_filter_keywords and resolved.get("intent_override") == "list_navigation":
             resolved["intent_override"] = None
             logger.info("Safety: cleared list_navigation override for filter query")
+
+        # Block list_navigation for ordinal+superlative — always needs fresh SQL
+        ordinal_superlative = [
+            "second largest", "second biggest", "second highest",
+            "second smallest", "second cheapest", "second lowest",
+            "second newest", "second oldest", "second most",
+            "third largest", "third highest", "third smallest",
+            "third cheapest", "fourth largest", "fifth largest",
+        ]
+        if any(p in q_lower for p in ordinal_superlative):
+            resolved["intent_override"] = None
+            logger.info("Safety: cleared list_navigation for ordinal+superlative — needs fresh SQL")
+
+        if any(p in q_lower for p in ordinal_superlative):
+            resolved["intent_override"] = None
+            logger.info("Safety: cleared list_navigation for ordinal+superlative — needs fresh SQL")
+
+        # ── ADD HERE ──
+        # "when was it uploaded" → needs fresh SQL with created_at, never list_navigation
+        upload_time_patterns = [
+            "when was it uploaded", "when was it added", "upload date",
+            "when was this uploaded", "upload time", "when did it arrive"
+        ]
+        if any(p in q_lower for p in upload_time_patterns):
+            resolved["intent_override"] = None
+            logger.info("Safety: cleared list_navigation for upload time query — needs fresh SQL")
+
 
         # ── Safety check: never override duplicate focus with amount ranking ──
         focus_topic = conversation_focus.get("topic", "") if conversation_focus else ""

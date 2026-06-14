@@ -26,7 +26,8 @@ from chatbot.response_synthesizer import (
     synthesize_response, synthesize_error, synthesize_general
 )
 from services.anomaly_detector import detect_outliers, detect_duplicates
-from services.vendor_matcher import find_matches, normalize, find_similar_vendors
+from services.vendor_matcher import find_matches, normalize, find_similar_vendors, similarity
+
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +71,76 @@ RULES:
 - operation=reuse_vendor when question asks about different document type for same vendor
 - operation=remove_limit when question asks to show all
 - If ambiguous → type=standalone
+- operation=reuse_vendor when user asks about a DIFFERENT document type using the same vendor
+  Example: user was looking at contracts, now asks "show related invoices" → reuse vendor, switch to invoices
+  Example: user was looking at invoices, now asks "contracts from same vendor" → reuse vendor, switch to contracts
 
 Return ONLY JSON. No explanation.
 """)
+
+# ── Helper: Fetch distinct vendor names from DB ───────────────────────────────
+
+async def get_all_vendor_names(db: AsyncSession) -> list:
+    sql = """
+        SELECT DISTINCT r.extracted_data->>'vendor_name' as vendor
+        FROM extraction_results r
+        WHERE r.extracted_data->>'vendor_name' IS NOT NULL
+          AND r.extracted_data->>'vendor_name' != ''
+    """
+    rows = await execute_query(sql, db)
+    return [r["vendor"] for r in rows if r.get("vendor")]
+
+
+# ── Helper: Resolve partial/abbreviated vendor mentions to canonical names ─────
+
+def resolve_vendor_names_in_question(question: str, all_vendors: list) -> str:
+    """
+    Detect partial/abbreviated vendor mentions and append canonical names
+    as a hint for SQL generation — preserves original question structure
+    so comparison/context keywords (vs, compare, between) are not lost.
+    """
+    if not all_vendors:
+        return question
+
+    words = question.split()
+    found_mappings = {}  # candidate -> canonical
+
+    for n in (3, 2, 1):
+        for i in range(len(words) - n + 1):
+            if any(idx in found_mappings for idx in range(i, i + n)):
+                continue
+            candidate = " ".join(words[i:i + n]).strip(",.?!:;")
+            if len(candidate) < 3:
+                continue
+
+            fuzzy = find_matches(candidate, all_vendors, threshold=0.55)
+            substring = [v for v in all_vendors if candidate.lower() in v.lower()]
+            candidates = list({*fuzzy, *substring})
+
+            if candidates:
+                best = max(candidates, key=lambda v: similarity(candidate, v))
+                if best.lower() != candidate.lower():
+                    found_mappings[i] = (candidate, best)
+                    for idx in range(i + 1, i + n):
+                        found_mappings[idx] = None  # mark as used
+
+    if not found_mappings:
+        return question
+
+    # Build canonical name hint — appended to preserve original structure
+    canonical_names = [
+        v for v in [
+            mapping[1] for mapping in found_mappings.values() if mapping
+        ]
+    ]
+
+    if not canonical_names:
+        return question
+
+    hint = ", ".join(f"'{n}'" for n in canonical_names)
+    resolved = f"{question} [vendor names: {hint}]"
+    logger.info(f"Vendor hint appended: {resolved}")
+    return resolved
 
 # ── Helper: Execute SQL ───────────────────────────────────────────────────────
 
@@ -96,6 +164,24 @@ async def execute_query(sql: str, db: AsyncSession) -> list:
         data.append(row_dict)
     return data
 
+def deduplicate_results(results: list) -> list:
+    """
+    Remove duplicate rows using filename as primary key.
+    Only deduplicate if filename exists — never collapse real unique rows.
+    """
+    seen = set()
+    deduped = []
+    for row in results:
+        filename = row.get("filename", "")
+        if filename:
+            # Use filename as unique key — most reliable identifier
+            if filename not in seen:
+                seen.add(filename)
+                deduped.append(row)
+        else:
+            # No filename — aggregation row, always keep
+            deduped.append(row)
+    return deduped
 
 # ── Helper: Complexity Check ──────────────────────────────────────────────────
 
@@ -339,6 +425,8 @@ def apply_operation_to_sql(
     """
     op = operation.get("operation")
     params = operation.get("params", {})
+    # Strip trailing semicolon — prevents "; LIMIT 200" syntax error
+    base_sql = base_sql.rstrip().rstrip(';').strip()
 
     if op == "sort":
         field = params.get("field", "amount")
@@ -374,20 +462,18 @@ def apply_operation_to_sql(
         elif "LIMIT" in sql_upper:
             clean = clean[:clean.upper().rfind("LIMIT")].strip()
 
-        # ── Guard: skip null string values from LLM ──
         vendor = params.get("vendor")
         currency = params.get("currency")
         amount_val = params.get("value")
 
-        if vendor and vendor.lower() not in ("null", "none", ""):
-            vendor = vendor.replace("'", "''")
+        if vendor and str(vendor).lower() not in ("null", "none", ""):
+            vendor = str(vendor).replace("'", "''")
             clean += f" AND LOWER(r.extracted_data->>'vendor_name') = LOWER('{vendor}')"
 
-        if currency and currency.lower() not in ("null", "none", ""):
-            currency = currency.replace("'", "''")
-            # Only add if not already in the WHERE clause
-            if f"currency' = '{currency}'" not in clean:
-                clean += f" AND r.extracted_data->>'currency' = '{currency}'"
+        # ── Only add currency if explicitly requested, not from active state ──
+        if currency and str(currency).lower() not in ("null", "none", "") and "only" in params.get("original_question", "").lower():
+            currency = str(currency).replace("'", "''")
+            clean += f" AND r.extracted_data->>'currency' = '{currency}'"
 
         if amount_val and str(amount_val).lower() not in ("null", "none", ""):
             try:
@@ -406,6 +492,50 @@ def apply_operation_to_sql(
         if "LIMIT" in sql:
             return base_sql[:base_sql.upper().rfind("LIMIT")] + "LIMIT 200"
         return base_sql
+
+    if op == "reuse_vendor":
+        vendor = params.get("vendor", "")
+        # Determine target document type from question
+        dataset = params.get("dataset", "contract")
+        doc_type = "contract" if "contract" in dataset else \
+                   "receipt" if "receipt" in dataset else \
+                   "invoice"
+
+        if not vendor or str(vendor).lower() in ("null", "none", ""):
+            return base_sql
+
+        vendor = str(vendor).replace("'", "''")
+
+        if doc_type == "contract":
+            return f"""
+                    SELECT DISTINCT ON (d.filename) d.filename,
+                        r.extracted_data->>'parties' as parties,
+                        r.extracted_data->>'value' as value,
+                        r.extracted_data->>'currency' as currency,
+                        r.extracted_data->>'start_date' as start_date,
+                        r.extracted_data->>'end_date' as end_date
+                    FROM documents d
+                    JOIN extraction_results r ON r.doc_id = d.id
+                    WHERE r.document_type = 'contract'
+                    AND d.status = 'done'
+                    AND r.extracted_data->>'parties' ILIKE '%{vendor}%'
+                    ORDER BY d.filename, d.created_at DESC
+                    LIMIT 200
+                    """
+        else:
+            return f"""
+                    SELECT DISTINCT ON (d.filename) d.filename,
+                        r.extracted_data->>'vendor_name' as vendor,
+                        NULLIF(REGEXP_REPLACE(r.extracted_data->>'total_amount','[^0-9.]','','g'),'')::numeric as amount,
+                        r.extracted_data->>'currency' as currency
+                    FROM documents d
+                    JOIN extraction_results r ON r.doc_id = d.id
+                    WHERE r.document_type = '{doc_type}'
+                    AND d.status = 'done'
+                    AND LOWER(r.extracted_data->>'vendor_name') = LOWER('{vendor}')
+                    ORDER BY d.filename, d.created_at DESC
+                    LIMIT 200
+                    """
 
     return base_sql
 
@@ -607,6 +737,273 @@ async def process_message(
             except Exception as e:
                 logger.error(f"[{session_id}] Repeat detection failed: {e}", exc_info=True)
 
+    # ── Step 3f: Handle overdue/expiring with safe Python SQL ────
+    overdue_keywords = ["overdue", "past due", "late payment", "unpaid", "outstanding"]
+    expiring_keywords = ["expiring", "expiring soon", "ending soon", "renewal due"]
+
+    if any(kw in question.lower() for kw in overdue_keywords):
+        logger.info(f"[{session_id}] Overdue invoice detection triggered")
+        overdue_sql = r"""
+            SELECT DISTINCT ON (d.filename)
+                d.filename,
+                r.extracted_data->>'vendor_name' as vendor,
+                r.extracted_data->>'due_date' as due_date,
+                r.extracted_data->>'total_amount' as amount,
+                r.extracted_data->>'currency' as currency
+            FROM documents d
+            JOIN extraction_results r ON r.doc_id = d.id
+            WHERE r.document_type = 'invoice'
+            AND d.status = 'done'
+            AND r.extracted_data->>'due_date' IS NOT NULL
+            AND r.extracted_data->>'due_date' != ''
+            AND (
+                CASE
+                    WHEN r.extracted_data->>'due_date' ~ '^\d{4}-\d{2}-\d{2}$'
+                    THEN TO_DATE(r.extracted_data->>'due_date', 'YYYY-MM-DD')
+                    WHEN r.extracted_data->>'due_date' ~ '^\d{1,2}/\d{1,2}/\d{4}$'
+                    THEN TO_DATE(r.extracted_data->>'due_date', 'DD/MM/YYYY')
+                    WHEN r.extracted_data->>'due_date' ~ '^\d{1,2}\.\d{1,2}\.\d{4}$'
+                    THEN TO_DATE(r.extracted_data->>'due_date', 'DD.MM.YYYY')
+                    WHEN r.extracted_data->>'due_date' ~ '^\d{1,2} \w+ \d{4}$'
+                    THEN TO_DATE(r.extracted_data->>'due_date', 'DD Month YYYY')
+                    ELSE NULL
+                END
+            ) < CURRENT_DATE
+            ORDER BY d.filename
+            LIMIT 200
+        """
+        is_valid, _ = validate_sql(overdue_sql)
+        if is_valid:
+            try:
+                overdue_results = await execute_query(overdue_sql, db)
+                answer = _build_list_response(overdue_results, question) if overdue_results else "No overdue invoices found."
+                new_focus = build_conversation_focus("overdue", question, overdue_results, {}, conversation_focus)
+                set_conversation_focus(session_id, new_focus)
+                set_last_results(session_id, overdue_results)
+                update_active_state(session_id, {
+                    "intent": "overdue_invoices",
+                    "active_dataset": "invoice",
+                    "result_count": len(overdue_results),
+                    "last_sql": overdue_sql
+                })
+                save_turn(session_id, "assistant", answer, {
+                    "intent": "overdue_invoices",
+                    "count": len(overdue_results),
+                    "results_sample": overdue_results[:3]
+                })
+                return {
+                    "answer": answer,
+                    "intent": "overdue_invoices",
+                    "session_id": session_id,
+                    "rewritten": None,
+                    "sql": overdue_sql,
+                    "results": overdue_results,
+                    "count": len(overdue_results)
+                }
+            except Exception as e:
+                logger.error(f"[{session_id}] Overdue detection failed: {e}", exc_info=True)
+
+    if any(kw in question.lower() for kw in expiring_keywords):
+        logger.info(f"[{session_id}] Expiring contract detection triggered")
+        expiring_sql = r"""
+            SELECT DISTINCT ON (d.filename)
+                d.filename,
+                r.extracted_data->>'parties' as parties,
+                r.extracted_data->>'end_date' as end_date,
+                r.extracted_data->>'value' as value,
+                r.extracted_data->>'currency' as currency
+            FROM documents d
+            JOIN extraction_results r ON r.doc_id = d.id
+            WHERE r.document_type = 'contract'
+            AND d.status = 'done'
+            AND r.extracted_data->>'end_date' IS NOT NULL
+            AND r.extracted_data->>'end_date' != ''
+            AND (
+                CASE
+                    WHEN r.extracted_data->>'end_date' ~ '^\d{4}-\d{2}-\d{2}$'
+                    THEN TO_DATE(r.extracted_data->>'end_date', 'YYYY-MM-DD')
+                    WHEN r.extracted_data->>'end_date' ~ '^\d{1,2}/\d{1,2}/\d{4}$'
+                    THEN TO_DATE(r.extracted_data->>'end_date', 'DD/MM/YYYY')
+                    WHEN r.extracted_data->>'end_date' ~ '^\d{1,2}\.\d{1,2}\.\d{4}$'
+                    THEN TO_DATE(r.extracted_data->>'end_date', 'DD.MM.YYYY')
+                    WHEN r.extracted_data->>'end_date' ~ '^\d{1,2} \w+ \d{4}$'
+                    THEN TO_DATE(r.extracted_data->>'end_date', 'DD Month YYYY')
+                    ELSE NULL
+                END
+            ) BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days'
+            ORDER BY d.filename
+            LIMIT 200
+        """
+        is_valid, _ = validate_sql(expiring_sql)
+        if is_valid:
+            try:
+                expiring_results = await execute_query(expiring_sql, db)
+                answer = _build_list_response(expiring_results, question) if expiring_results else "No contracts expiring in the next 30 days."
+                new_focus = build_conversation_focus("expiring", question, expiring_results, {}, conversation_focus)
+                set_conversation_focus(session_id, new_focus)
+                set_last_results(session_id, expiring_results)
+                save_turn(session_id, "assistant", answer, {
+                    "intent": "expiring_contracts",
+                    "count": len(expiring_results),
+                    "results_sample": expiring_results[:3]
+                })
+                return {
+                    "answer": answer,
+                    "intent": "expiring_contracts",
+                    "session_id": session_id,
+                    "rewritten": None,
+                    "sql": expiring_sql,
+                    "results": expiring_results,
+                    "count": len(expiring_results)
+                }
+            except Exception as e:
+                logger.error(f"[{session_id}] Expiring detection failed: {e}", exc_info=True)
+
+    # ── Step 3g: Handle total invoice amount by currency ─────
+    total_keywords = [
+        "total amount of all invoices", "total invoices amount",
+        "grand total of all", "overall total of all",
+        "sum of all invoices", "total amount all invoices"
+    ]
+    if any(kw in question.lower() for kw in total_keywords):
+        logger.info(f"[{session_id}] Total invoice amount by currency triggered")
+        total_sql = """
+            SELECT
+                r.extracted_data->>'currency' as currency,
+                ROUND(SUM(
+                    NULLIF(
+                        REGEXP_REPLACE(
+                            r.extracted_data->>'total_amount',
+                            '[^0-9.]', '', 'g'
+                        ), ''
+                    )::numeric
+                ), 2) as total_amount,
+                COUNT(*) as invoice_count
+            FROM documents d
+            JOIN extraction_results r ON r.doc_id = d.id
+            WHERE r.document_type = 'invoice'
+            AND d.status = 'done'
+            AND r.extracted_data->>'currency' IS NOT NULL
+            GROUP BY currency
+            ORDER BY total_amount DESC
+        """
+        
+
+        is_valid, _ = validate_sql(total_sql)
+        if is_valid:
+            try:
+                total_results = await execute_query(total_sql, db)
+                if total_results:
+                    lines = ["Invoices span multiple currencies. Totals per currency:\n"]
+                    for row in total_results:
+                        try:
+                            amount = f"{float(row.get('total_amount', 0)):,.2f}"
+                        except (ValueError, TypeError):
+                            amount = str(row.get('total_amount', 0))
+                        lines.append(
+                            f"• {row.get('currency')} — "
+                            f"{amount} "
+                            f"({row.get('invoice_count')} invoices)"
+                        )
+                    answer = "\n".join(lines)
+                else:
+                    answer = "No invoice totals found."
+
+                save_turn(session_id, "assistant", answer, {
+                    "intent": "total_by_currency",
+                    "count": len(total_results),
+                    "results_sample": total_results[:3]
+                })
+                return {
+                    "answer": answer,
+                    "intent": "total_by_currency",
+                    "session_id": session_id,
+                    "rewritten": None,
+                    "sql": total_sql,
+                    "results": total_results,
+                    "count": len(total_results)
+                }
+            except Exception as e:
+                logger.error(f"[{session_id}] Total by currency failed: {e}", exc_info=True)
+
+    # ── Step 3h: Handle currency comparison queries ───────
+    currency_keywords = [
+        "which currency has the most", "currency breakdown",
+        "spending by currency", "total by currency",
+        "which currency is highest", "highest currency total"
+    ]
+    if any(kw in question.lower() for kw in currency_keywords):
+        logger.info(f"[{session_id}] Currency breakdown triggered")
+        currency_sql = """
+            SELECT
+                r.extracted_data->>'currency' as currency,
+                ROUND(SUM(
+                    NULLIF(
+                        REGEXP_REPLACE(
+                            r.extracted_data->>'total_amount',
+                            '[^0-9.]', '', 'g'
+                        ), ''
+                    )::numeric
+                ), 2) as total_amount,
+                COUNT(*) as invoice_count
+            FROM documents d
+            JOIN extraction_results r ON r.doc_id = d.id
+            WHERE r.document_type = 'invoice'
+            AND d.status = 'done'
+            AND r.extracted_data->>'currency' IS NOT NULL
+            GROUP BY currency
+            ORDER BY total_amount DESC
+        """
+        is_valid, _ = validate_sql(currency_sql)
+        if is_valid:
+            try:
+                currency_results = await execute_query(currency_sql, db)
+                if currency_results:
+                    top = currency_results[0]
+                    try:
+                        top_amount = f"{float(top.get('total_amount', 0)):,.2f}"
+                    except (ValueError, TypeError):
+                        top_amount = str(top.get('total_amount', 0))
+
+                    lines = [
+                        f"USD leads with the highest total. Full breakdown:\n"
+                        if top.get('currency') == 'USD'
+                        else f"{top.get('currency')} has the highest total at {top_amount}. Full breakdown:\n"
+                    ]
+                    for row in currency_results:
+                        try:
+                            amount = f"{float(row.get('total_amount', 0)):,.2f}"
+                        except (ValueError, TypeError):
+                            amount = str(row.get('total_amount', 0))
+                        lines.append(
+                            f"• {row.get('currency')} — {amount} "
+                            f"({row.get('invoice_count')} invoices)"
+                        )
+                    answer = "\n".join(lines)
+                else:
+                    answer = "No currency data found."
+
+                save_turn(session_id, "assistant", answer, {
+                    "intent": "currency_breakdown",
+                    "count": len(currency_results),
+                    "results_sample": currency_results[:3]
+                })
+                return {
+                    "answer": answer,
+                    "intent": "currency_breakdown",
+                    "session_id": session_id,
+                    "rewritten": None,
+                    "sql": currency_sql,
+                    "results": currency_results,
+                    "count": len(currency_results)
+                }
+            except Exception as e:
+                logger.error(f"[{session_id}] Currency breakdown failed: {e}", exc_info=True)
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+
     # ── Step 4: Decompose if complex ─────────────
     if is_complex_question(question):
         logger.info(f"[{session_id}] Complex question — decomposing")
@@ -621,7 +1018,7 @@ async def process_message(
                     conversation_focus=conversation_focus
                 )
                 sub_rewritten = rewrite_query(sub_q, history, last_metadata, sub_context)
-                sub_sql = generate_sql(sub_rewritten, history, sub_context)
+                sub_sql = generate_sql(sub_rewritten, history, sub_context, all_vendors=all_vendors)
 
                 if not sub_sql:
                     continue
@@ -725,7 +1122,24 @@ async def process_message(
         "how much total", "total paid", "sum of", "average",
         "how many", "count of", "breakdown", "percentage",
         "show invoices", "show contracts", "show receipts",
-        "find invoices", "find contracts", "find vendors"
+        "find invoices", "find contracts", "find vendors",
+        # ── ADD THESE ──
+        "show all receipts", "list receipts", "all receipts",
+        "eur invoices", "usd invoices", "gbp invoices",
+        "invoices only", "only eur", "only usd",
+        "overdue", "expiring", "expired", "past due",
+        "brightpath", "nordic", "eurodata", "quantumcore",
+        "finedge", "bluewave", "techno", "cloudpeak",
+        "invoices from", "contracts from", "receipts from",
+        "documents from", "show all documents",
+        "smallest", "largest", "cheapest", "most expensive",
+        "newest", "oldest", "latest", "earliest",
+        "failed", "error", "processing",
+        "what document", "document types", "how many documents",
+        "document type", "what type", "which types",
+        "total amount", "total of all", "sum of all",
+        "total eur", "total usd", "total spending",
+        "grand total", "overall total",
     ])
 
     if not skip_transform and active_state.get("last_sql"):
@@ -808,8 +1222,19 @@ async def process_message(
     rewritten = rewrite_query(question, history, last_metadata, resolved_context)
     logger.info(f"[{session_id}] Rewritten: {rewritten}")
 
+    # ── Step 6.5: Resolve vendor mentions to canonical DB names ──
+    try:
+        all_vendors = await get_all_vendor_names(db)
+        sql_input_question = resolve_vendor_names_in_question(rewritten, all_vendors)
+        if sql_input_question != rewritten:
+            logger.info(f"[{session_id}] Vendor resolved for SQL: '{rewritten}' -> '{sql_input_question}'")
+    except Exception as e:
+        logger.error(f"[{session_id}] Vendor resolution failed: {e}")
+        sql_input_question = rewritten
+
+
     # ── Step 7: Generate SQL ──────────────────────
-    sql = generate_sql(rewritten, history, resolved_context)
+    sql = generate_sql(sql_input_question, history, resolved_context, all_vendors=all_vendors)
     logger.info(f"[{session_id}] Generated SQL: '{sql}'")
 
     if not sql:
@@ -841,10 +1266,30 @@ async def process_message(
             "count": 0
         }
 
-    # ── Step 9: Execute SQL ───────────────────────
+        # ── Step 9: Execute SQL ───────────────────────
     try:
         results = await execute_query(sql, db)
         logger.info(f"[{session_id}] Query returned {len(results)} rows")
+
+        # ── Deduplicate by filename + document_type ──
+        seen = set()
+        deduped = []
+        for row in results:
+            # Create unique key from filename + any ID field available
+            key = (
+                row.get("filename", "") or
+                row.get("invoice_number", "") or
+                row.get("doc_id", "")
+            )
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(row)
+            elif not key:
+                deduped.append(row)  # keep rows without filename (aggregations)
+        if len(deduped) < len(results):
+            logger.info(f"[{session_id}] After dedup: {len(deduped)} rows")
+            results = deduped
+
     except Exception as e:
         logger.error(f"[{session_id}] Query failed: {e}", exc_info=True)
         answer = synthesize_error(question, str(e))
@@ -873,6 +1318,13 @@ async def process_message(
         if outliers or duplicates:
             results = outliers + duplicates
             logger.info(f"[{session_id}] Anomalies found: {len(results)}")
+
+    # Deduplicate results
+    results = deduplicate_results(results)
+
+    # Hard cap
+    # results = results[:50]
+    logger.info(f"[{session_id}] After dedup: {len(results)} rows")
 
     # ── Step 11: Synthesize response ──────────────
     answer = synthesize_response(
@@ -957,6 +1409,6 @@ async def process_message(
         "session_id": session_id,
         "rewritten": rewritten if rewritten != question else None,
         "sql": sql,
-        "results": results,
+        "results": results[:20],
         "count": len(results)
     }

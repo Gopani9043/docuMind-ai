@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY"),
-    model_name=os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
+    model_name=os.getenv("LLM_MODEL", "llama-3.1-8b-instant"),
     temperature=0,
 )
 
@@ -72,6 +72,16 @@ REWRITING RULES:
 - "show related contracts" + context has vendor → "Show contracts where parties contains [vendor]"
 - "give me vendor name" + duplicate context → "What is the vendor of the most repeated invoice?"
 - If question is already clear and specific → return it unchanged
+FILTER RULES — CRITICAL:
+- "only [vendor]" or "only [vendor] from above" → "Show all invoices above 10000 EUR from [vendor]"
+  NEVER rewrite to "largest" — user wants ALL filtered results
+- "only above X" → add amount filter to previous query
+- "only EUR" or "only USD" → add currency filter to previous query
+- "smallest one" or "cheapest one" AFTER a filter query → 
+  "Show the smallest invoice from [vendor] above [amount] [currency]"
+  ALWAYS carry forward ALL previous filters — vendor, currency, amount threshold
+- "largest one" AFTER a filter query →
+  "Show the largest invoice from [vendor] above [amount] [currency]"
 
 Return ONLY the rewritten question. No explanation. No quotes. No markdown.
 
@@ -83,7 +93,21 @@ STANDALONE_PATTERNS = [
     "show all", "list all", "how many total",
     "give me all", "find all", "what is the total",
     "top 10", "top 5", "show invoices", "show contracts",
-    "show receipts", "show documents"
+    "show receipts", "show documents",
+    "second largest", "second biggest", "second highest", "second most expensive",
+    "second smallest", "second cheapest", "second lowest",
+    "second newest", "second oldest",
+    "third largest", "third highest", "third smallest", "third cheapest",
+    "fourth largest", "fifth largest",
+    "most expensive", "cheapest invoice", "cheapest contract",
+    "newest invoice", "oldest invoice", "newest contract", "oldest contract",
+    "show the 10", "show the 5", "show the 3",
+    # Comparison queries — always fresh SQL, never rewrite
+    "compare eur", "compare usd", "compare gbp",
+    "compare brightpath", "compare finedge", "compare nordic",
+    "eur vs usd", "usd vs eur", "vs usd", "vs eur",
+    "compare average", "compare total",
+
 ]
 
 # Vague reference indicators — always trigger rewrite
@@ -98,15 +122,15 @@ VAGUE_INDICATORS = [
     "when was it", "when was it uploaded", "show related",
     "is this", "what invoice", "what contract",
     "how many times", "repeat", "how often", "appear",
-    "the second", "the third", "next one", "previous one",
+    "next one", "previous one",         # removed "the second", "the third"
     "show them", "list them", "what currency", "how much",
-    "newest", "oldest", "latest", "earliest",
     "give me", "vendor name", "this invoice", "this vendor",
     "only ", "just ", "from them", "show all from",
     "their invoices", "their contracts", "all from",
-    "from that vendor", "from same vendor"
+    "from that vendor", "from same vendor","only ",
+    # removed "newest", "oldest", "latest", "earliest"
+]
 
-]   
 
 
 def rewrite_query(
@@ -120,9 +144,24 @@ def rewrite_query(
     Returns original question if already clear.
     """
     q_lower = question.lower().strip()
+    ordinal_superlative = [
+        "second largest", "second biggest", "second highest", "second most",
+        "second smallest", "second cheapest", "second lowest",
+        "second newest", "second oldest",
+        "third largest", "third highest", "third smallest",
+        "what is the second", "what is the third",
+    ]
+    # Never rewrite comparison queries — they need fresh SQL
+    if " vs " in q_lower or "compare " in q_lower:
+        logger.info(f"Comparison query — no rewrite: '{question}'")
+        return question
+
+    if any(p in q_lower for p in ordinal_superlative):
+        logger.info(f"Ordinal+superlative — no rewrite: '{question}'")
+        return question
     intent_override = resolved_context.get("intent_override") if resolved_context else None
     conversation_focus = resolved_context.get("conversation_focus", "") or ""
-
+    
     # ── Check duplicate focus BEFORE any override ──
     is_duplicate_focus = any(k in str(conversation_focus).lower() for k in
                              ["duplicate", "repeat", "duplicate_invoices"])

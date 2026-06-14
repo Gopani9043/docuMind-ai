@@ -4,10 +4,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def detect_outliers(results: list[dict], amount_field: str = "amount") -> list[dict]:
+def detect_outliers(results: list, amount_field: str = "amount") -> list:
     """
     Z-score outlier detection on invoice amounts.
     Flags anything above z-score 2.0.
+    Works for any dataset — amount field is configurable.
     """
     if len(results) < 3:
         return []
@@ -48,22 +49,47 @@ def detect_outliers(results: list[dict], amount_field: str = "amount") -> list[d
     return outliers
 
 
-def detect_duplicates(results: list[dict]) -> list[dict]:
+def detect_duplicates(results: list) -> list:
     """
-    Find invoices with same vendor and same amount.
+    Find duplicate invoices by matching on filename or invoice_number.
+    Universal — works for any dataset, any vendor.
+
+    Previous version matched vendor+amount which failed when amount=0.
+    This version matches on the actual invoice identifier.
     """
     seen = {}
     duplicates = []
 
     for row in results:
-        vendor = str(row.get("vendor", "")).strip().lower()
-        amount = str(row.get("amount", "")).strip()
-        key = f"{vendor}|{amount}"
+        # ── Universal key: use filename or invoice_number, not amount ──
+        # Try multiple field names to be compatible with any SQL result shape
+        identifier = (
+            row.get("filename") or
+            row.get("invoice_number") or
+            row.get("invoice_id") or
+            row.get("doc_id") or
+            ""
+        ).strip().lower()
+
+        vendor = (
+            row.get("vendor") or
+            row.get("vendor_name") or
+            ""
+        ).strip().lower()
+
+        # Key on identifier alone — vendor is secondary
+        key = identifier if identifier else vendor
+
+        if not key:
+            continue
 
         if key in seen:
-            if key not in [d.get("_dup_key") for d in duplicates]:
-                duplicates.append({**seen[key], "_dup_key": key, "duplicate": True})
-            duplicates.append({**row, "_dup_key": key, "duplicate": True})
+            # First time we see a duplicate — add the original too
+            orig_key = f"_orig_{key}"
+            if orig_key not in seen:
+                duplicates.append({**seen[key], "duplicate": True})
+                seen[orig_key] = True
+            duplicates.append({**row, "duplicate": True})
         else:
             seen[key] = row
 

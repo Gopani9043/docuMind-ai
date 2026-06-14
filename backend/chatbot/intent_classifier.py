@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY"),
-    model_name=os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
+    model_name=os.getenv("LLM_MODEL", "llama-3.1-8b-instant"),
     temperature=0,
 )
 
@@ -65,7 +65,14 @@ def classify_intent(question: str, history: str = "") -> str:
     "invoice", "contract", "receipt", "vendor", "amount", "currency",
     "overdue", "expiring", "missing", "uploaded", "this month",
     "last month", "this week", "trend", "breakdown", "distribution",
-    "spelling", "duplicate", "similar", "fuzzy", "suspicious", "anomaly"  # ← add these
+    "spelling", "duplicate", "similar", "fuzzy", "suspicious", "anomaly",
+    # ── ADD THESE ──
+    "document type", "what type", "which type", "how many document",
+    "what document", "status", "failed", "processing", "done",
+    "how much", "who", "which", "what is the", "what are",
+    "when was", "when were", "largest", "smallest", "newest", "oldest",
+    "latest", "earliest", "repeat", "appears", "paid", "spent",
+    "document", "report", "file", "pdf"
     ]
     if any(kw in q_lower for kw in sql_keywords):
         return "sql_analytics"

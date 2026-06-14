@@ -18,7 +18,8 @@ engine = create_async_engine(
     DATABASE_URL,
     echo=True,
     pool_size=5,
-    max_overflow=10
+    max_overflow=10,
+    connect_args={"ssl": False}
 )
 
 # ── Session factory ───────────────────────────────
