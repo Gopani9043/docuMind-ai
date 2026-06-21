@@ -1,19 +1,20 @@
 import os
 import json
 import logging
-from langchain_groq import ChatGroq
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 from services.vendor_matcher import normalize
+from chatbot.llm_provider import invoke_with_fallback
+
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-llm = ChatGroq(
-    api_key=os.getenv("GROQ_API_KEY"),
-    model_name=os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
-    temperature=0,
-)
+# llm = ChatGroq(
+#     api_key=os.getenv("GROQ_API_KEY"),
+#     model_name=os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
+#     temperature=0,
+# )
 
 SYNTHESIS_PROMPT = ChatPromptTemplate.from_template("""
 You are a financial analytics assistant.
@@ -32,6 +33,17 @@ Your job is to analyze the result structure and produce a clean business answer.
 ────────────────────────────────────
 TYPE DETECTION RULES
 ────────────────────────────────────
+
+CHECK IN THIS EXACT ORDER — stop at the first match:
+1. EMPTY
+2. TREND (month column exists in any row) — always wins over Comparison/Grouped Breakdown
+3. DUPLICATES
+4. CONTRACT EXPIRY
+5. DOCUMENT LIST
+6. COMPARISON
+7. GROUPED BREAKDOWN
+8. RANKING
+9. SINGLE FACT
 
 TYPE: EMPTY
 If Results is empty:
@@ -112,7 +124,8 @@ TYPE: GROUPED BREAKDOWN
 Conditions:
 - Multiple rows
 - Aggregated values
-- Group by vendor, currency, document type, month, etc.
+- Group by vendor, currency, document type, etc.
+- Rows do NOT contain a "month" column (month data is always TREND, never Grouped Breakdown)
 
 Output:
 
@@ -132,6 +145,7 @@ TYPE: COMPARISON
 Conditions:
 - Exactly 2 or more grouped rows
 - User asks compare, versus, vs
+- Rows do NOT contain a "month" column (month data is always TREND, never Comparison)
 
 Output:
 
@@ -164,8 +178,8 @@ Use whatever groups are present in Results.
 ────────────────────────────────────
 
 TYPE: TREND
-Conditions:
-- month column exists
+Conditions (check this BEFORE Comparison/Grouped Breakdown — always wins if true):
+- month column exists in any row
 OR
 date-based aggregation
 
@@ -179,6 +193,9 @@ May 2026: 410,000.00
 
 Insight:
 One short sentence describing the trend.
+
+Display rows in the exact order given in Results — never resort by value.
+Never say "Winner" or "leads by" — that phrasing belongs only to COMPARISON.
 
 Examples:
 "Spending increased over the period."
@@ -233,6 +250,9 @@ GENERAL RULES
 - Use concise business language.
 - Maximum 10 displayed rows.
 - Always choose the output type from the actual result structure, not from the question text.
+- NEVER assume USD or any default currency symbol
+- NEVER use "$" unless the data explicitly contains currency = "USD"
+- If results have multiple currencies, ALWAYS show each currency separately — never combine into one number
 
 Answer:
 """)
@@ -261,26 +281,42 @@ def synthesize_response(
 ) -> str:
     """Synthesize response — lists generated in Python, facts by LLM."""
     try:
+        original_question = original_question or ""
+        rewritten_question = rewritten_question or ""
+        history = history or ""
+        intent = intent or ""
+    
         if intent == "greeting":
-            chain = GREETING_PROMPT | llm
-            response = chain.invoke({
-                "question": original_question,
-                "history": history or "No history"
-            })
-            return response.content.strip()
+            return invoke_with_fallback(
+                lambda llm: GREETING_PROMPT | llm,
+                {
+                    "question": original_question,
+                    "history": history or "No history"
+                }
+            )
 
         if intent == "clarification":
-            chain = CLARIFICATION_PROMPT | llm
-            response = chain.invoke({
-                "question": original_question,
-                "history": history or "No history"
-            })
-            return response.content.strip()
+            return invoke_with_fallback(
+                lambda llm: CLARIFICATION_PROMPT | llm,
+                {
+                    "question": original_question,
+                    "history": history or "No history"
+                }
+            )
 
         if not results:
             q = original_question.lower()
             if any(k in q for k in ["failed", "error", "broken"]):
                 return "No failed documents found. All documents processed successfully."
+            # Check combined overdue + expiring FIRST, before generic overdue check
+            if any(k in q for k in ["overdue", "past due", "late"]) and \
+               any(k in q for k in ["expiring", "expire", "contract"]):
+                return (
+                    "No overdue invoices found from vendors who also have "
+                    "contracts expiring in the next 30 days. There may be "
+                    "overdue invoices in the system, but none of those "
+                    "vendors currently have expiring contracts."
+                )
             if any(k in q for k in ["overdue", "past due", "late"]):
                 return "No overdue invoices found. All invoices are within their due dates."
             if any(k in q for k in ["expiring", "expired", "ending soon"]):
@@ -289,9 +325,14 @@ def synthesize_response(
                 return "No receipts found in your documents."
             return "No results found."
 
+        # ── Anomaly queries: use LLM to explain reasons ──
+        anomaly_words = ["unusual", "suspicious", "anomal", "outlier", "fraud", "weird", "abnormal"]
+        if any(w in original_question.lower() for w in anomaly_words):
+            return synthesize_anomaly(results, original_question, history)
+
         # ── Period/month comparisons: handle in Python, bypass the LLM ──
-        has_period = results and results[0].get("period")
-        has_month = results and results[0].get("month")
+        has_period = results and "period" in results[0]
+        has_month = results and "month" in results[0]
         looks_like_comparison = (
             ("compare" in original_question.lower() or " vs " in original_question.lower() or "versus" in original_question.lower())
             and not results[0].get("filename")
@@ -318,13 +359,15 @@ def synthesize_response(
         if is_aggregation or is_single_fact:
             # Use LLM for aggregation and single facts
             results_str = json.dumps(results[:10], indent=2, default=str)
-            chain = SYNTHESIS_PROMPT | llm
-            response = chain.invoke({
-                "question": original_question,
-                "results": results_str,
-                "intent": intent
-            })
-            return response.content.strip()
+            return invoke_with_fallback(
+                lambda llm: SYNTHESIS_PROMPT | llm,
+                {
+                    "question": original_question,
+                    "results": results_str,
+                    "intent": intent
+                }
+            )
+
 
         # ── List query — generate in Python, no LLM ──
         return _build_list_response(results, original_question)
@@ -420,6 +463,48 @@ def _build_list_response(results: list, question: str) -> str:
                 f"from {fmt_month(prev_month)} ({prev_total_fmt}) "
                 f"to {fmt_month(month)} ({total_fmt})."
             )
+        # ── Month trend result — MUST be checked before vendor comparison ──
+        # (trend rows also have 'total_amount' which would otherwise match
+        # the vendor comparison block below)
+        if "month" in results[0]:
+            from datetime import datetime
+            lines = ["📈 Monthly Trend\n"]
+            sorted_results = sorted(results, key=lambda r: r.get("month") or "")
+
+            for row in sorted_results:
+                month_raw = row.get("month", "")
+                month_label = str(month_raw)[:7] if month_raw else "Unknown"
+                try:
+                    dt = datetime.fromisoformat(str(month_raw).replace("Z", "+00:00"))
+                    month_label = dt.strftime("%b %Y")
+                except Exception:
+                    pass
+
+                count = row.get("invoice_count") or row.get("count") or 0
+                amount = row.get("total_amount") or row.get("amount") or row.get("total") or 0
+                currency = row.get("currency", "")
+                try:
+                    amount_fmt = f"{float(amount):,.2f}"
+                except (ValueError, TypeError):
+                    amount_fmt = str(amount)
+
+                lines.append(f"{month_label}: {count} invoices | {amount_fmt} {currency}".strip())
+
+            try:
+                amounts = [float(r.get("total_amount") or r.get("amount") or 0) for r in sorted_results]
+                if len(amounts) >= 2:
+                    if amounts[-1] > amounts[0]:
+                        insight = "Spending increased over the period."
+                    elif amounts[-1] < amounts[0]:
+                        insight = "Spending decreased over the period."
+                    else:
+                        insight = "Spending remained stable."
+                    lines.append(f"\n{insight}")
+            except (ValueError, TypeError):
+                pass
+
+            lines.append(f"\n{len(results)} result{'s' if len(results) != 1 else ''} total.")
+            return "\n".join(lines)
 
         # ── Vendor/group comparison (e.g. "X vs Y total spending") ──
         if len(results) >= 2 and any(
@@ -438,7 +523,7 @@ def _build_list_response(results: list, question: str) -> str:
                 # (handles "BrightPath Analytics" vs "BrightPath Analytics Ltd")
                 merged = {}
                 for row in results:
-                    label = row.get(label_key, "Unknown")
+                    label = row.get(label_key) or "Unknown"
                     raw = row.get(value_key, 0)
                     try:
                         val = float(raw)
@@ -494,43 +579,92 @@ def _build_list_response(results: list, question: str) -> str:
         else:
             unique.append(row)
 
+    def clean_parties(raw_parties):
+        """Parse contract parties JSON into a clean readable name string."""
+        if not raw_parties:
+            return ""
+        try:
+            parsed = json.loads(raw_parties) if isinstance(raw_parties, str) else raw_parties
+            if isinstance(parsed, list):
+                names = [
+                    p.get("name", "") if isinstance(p, dict) else str(p)
+                    for p in parsed
+                ]
+                names = [
+                    n for n in names
+                    if n and n not in ("[MISSING_COMPANY_NAME]", "PARTY B (CLIENT)")
+                ]
+                return " / ".join(names)
+            return str(parsed)
+        except (json.JSONDecodeError, TypeError):
+            return str(raw_parties)
+
     lines = []
     show_count = min(len(unique), 50)
 
     for i, row in enumerate(unique[:show_count], 1):
         filename = row.get("filename", "")
+        is_contract_row = bool(row.get("parties")) and not row.get("vendor_name") and not row.get("vendor")
         vendor = (
             row.get("vendor") or
             row.get("vendor_name") or
-            row.get("parties") or ""
+            (clean_parties(row.get("parties")) if row.get("parties") else "")
         )
         amount = (
             row.get("amount") or
             row.get("total_paid") or
             row.get("value") or
-            row.get("total") or ""
+            row.get("total") or 
+            row.get("total_amount") or ""
         )
         currency = row.get("currency", "")
         repeat_count = row.get("repeat_count")
         invoice_number = row.get("invoice_number", "")
         due_date = row.get("due_date") or row.get("end_date") or ""
+        date_label = "due" if row.get("due_date") else ("expires" if row.get("end_date") else "due")
+        has_dup = row.get("has_duplicate", "")
+        issue_date = row.get("issue_date", "")
+        overdue_days = row.get("overdue_days", "")
 
-        # Build exactly ONE line per row
+        # Detect missing fields
+        missing = []
+        if not row.get("value") and not row.get("amount") and not row.get("total"):
+            missing.append("value")
+        if not row.get("due_date") and not row.get("end_date") and not row.get("start_date") and "date" in question.lower():
+            missing.append("date")
+        if not row.get("vendor") and not row.get("vendor_name") and not row.get("parties"):
+            missing.append("vendor")
+        if not row.get("currency"):
+            missing.append("currency")
+        missing_str = f" | ⚠️ missing: {', '.join(missing)}" if missing else ""
+
         if repeat_count:
             label = invoice_number or filename
             lines.append(f"{i}. {label} | {vendor} | {repeat_count} times")
         elif filename and vendor and amount and due_date:
-            lines.append(f"{i}. {filename} | {vendor} | {amount} {currency} | due: {due_date}".strip())
+            line = f"{i}. {filename} | {vendor} | {amount} {currency} | {date_label}: {due_date}"
+            if overdue_days:
+                line += f" | {overdue_days} days overdue"
+            if has_dup == "Yes":
+                line += " ⚠️ DUPLICATE"
+            lines.append(line.strip())
         elif filename and vendor and amount:
-            lines.append(f"{i}. {filename} | {vendor} | {amount} {currency}".strip())
+            line = f"{i}. {filename} | {vendor} | {amount} {currency}{missing_str}".strip()
+            if issue_date:
+                line += f" | issued: {issue_date}"
+            if has_dup == "Yes":
+                line += " ⚠️ DUPLICATE"
+            lines.append(line)
         elif filename and vendor and due_date:
-            lines.append(f"{i}. {filename} | {vendor} | due: {due_date}")
+            lines.append(f"{i}. {filename} | {vendor} | {date_label}: {due_date}{missing_str}")
         elif filename and vendor:
-            lines.append(f"{i}. {filename} | {vendor}")
+            lines.append(f"{i}. {filename} | {vendor}{missing_str}")
+        elif filename and amount:
+            lines.append(f"{i}. {filename} | {amount} {currency}{missing_str}".strip())
         elif vendor and amount:
-            lines.append(f"{i}. {vendor} | {amount} {currency}".strip())
+            lines.append(f"{i}. {vendor} | {amount} {currency}{missing_str}".strip())
         else:
-            lines.append(f"{i}. {filename or vendor or 'unknown'}")
+            lines.append(f"{i}. {filename or vendor or 'unknown'}{missing_str}")
     result_text = "\n".join(lines)
 
     total = len(unique)
@@ -539,8 +673,50 @@ def _build_list_response(results: list, question: str) -> str:
     else:
         result_text += f"\n{total} result{'s' if total != 1 else ''} total."
 
+    # Add duplicate summary if has_duplicate column present
+    if unique and "has_duplicate" in unique[0]:
+        dup_count = sum(1 for r in unique if r.get("has_duplicate") == "Yes")
+        if dup_count == 0:
+            result_text += "\n✅ No duplicate invoice numbers found among these results."
+        else:
+            result_text += f"\n⚠️ {dup_count} invoice(s) have duplicate invoice numbers."
+        oldest = unique[0]
+        oldest_vendor = oldest.get("vendor") or oldest.get("vendor_name", "")
+        oldest_date = oldest.get("issue_date") or oldest.get("due_date") or "unknown"
+        result_text += (
+            f"\n📅 Oldest: {oldest.get('filename', 'unknown')} | "
+            f"{oldest_vendor} | issued: {oldest_date}"
+        )
+
     return result_text
 
+def synthesize_anomaly(results: list, question: str, history: str) -> str:
+    """Use LLM to explain WHY each result is anomalous."""
+    try:
+        prompt = ChatPromptTemplate.from_template("""
+You are a financial fraud analyst reviewing invoice data.
+
+The following invoices were flagged as statistically unusual or anomalous:
+{results}
+
+For each flagged invoice, explain in ONE sentence why it looks suspicious or unusual
+(e.g. amount is far below/above average, duplicate detected, missing fields, etc).
+
+Format:
+⚠️ filename | vendor | amount — Reason: [one sentence explanation]
+
+Be specific. Use the actual numbers. Never say "based on the data".
+Answer:
+""")
+        return invoke_with_fallback(
+            lambda llm: prompt | llm,
+            {
+                "results": json.dumps(results[:10], indent=2, default=str),
+            }
+        )
+    except Exception as e:
+        logger.error(f"Anomaly synthesis failed: {e}")
+        return _build_list_response(results, question)
 
 
 def synthesize_error(question: str, error: str) -> str:
@@ -561,12 +737,13 @@ def synthesize_general(question: str, history: str) -> str:
         Question: {question}
         Answer:
         """)
-        chain = prompt | llm
-        response = chain.invoke({
-            "question": question,
-            "history": history or "No history"
-        })
-        return response.content.strip()
+        return invoke_with_fallback(
+            lambda llm: prompt | llm,
+            {
+                "question": question,
+                "history": history or "No history"
+            }
+        )
     except Exception as e:
         logger.error(f"General synthesis failed: {e}")
         return "I can help you analyze your documents. Try asking about invoices, contracts, or vendors."
@@ -577,32 +754,26 @@ def synthesize_multi(
     sub_results: list,
     history: str
 ) -> str:
-    """Synthesize response from multiple sub-question results."""
-    try:
-        prompt = ChatPromptTemplate.from_template("""
-        You are an executive financial analyst.
-        Combine these multiple query results into one concise analytical response.
+    """
+    Combine multiple sub-question results into one answer.
+    Uses Python formatting only — no LLM to prevent hallucination.
+    Only uses data actually returned from the database.
+    """
+    if not sub_results:
+        return "No results found."
 
-        RULES:
-        - Lead with the most important insight
-        - Max 5 sentences total
-        - Include all key numbers with currency
-        - Never say "Would you like..." or "I hope this helps"
-        - Be direct and analytical
+    sections = []
+    for sub in sub_results:
+        question = sub.get("question", "")
+        results = sub.get("results", [])
+        count = sub.get("count", 0)
 
-        ORIGINAL QUESTION: {question}
-        SUB-RESULTS: {results}
-        HISTORY: {history}
+        if not results:
+            sections.append(f"**{question}**\nNo results found.")
+            continue
 
-        Response:
-        """)
-        chain = prompt | llm
-        response = chain.invoke({
-            "question": original_question,
-            "results": str(sub_results)[:2000],
-            "history": history or "No history"
-        })
-        return response.content.strip()
-    except Exception as e:
-        logger.error(f"Multi synthesis failed: {e}")
-        return "\n\n".join([r.get("answer", "") for r in sub_results if r.get("answer")])
+        # Format each sub-result using existing list formatter
+        answer = _build_list_response(results, question or "")
+        sections.append(f"**{question}**\n{answer}")
+
+    return "\n\n".join(sections)

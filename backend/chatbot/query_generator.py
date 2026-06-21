@@ -1,18 +1,12 @@
 import os
 import re 
 import logging
-from langchain_groq import ChatGroq
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
-
+from chatbot.llm_provider import invoke_with_fallback
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-llm = ChatGroq(
-    api_key=os.getenv("GROQ_API_KEY"),
-    model_name=os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
-    temperature=0,
-)
 
 SQL_PROMPT = ChatPromptTemplate.from_template(r"""
 You are an expert PostgreSQL analyst for a document processing system.
@@ -23,7 +17,7 @@ documents: id(UUID), filename(TEXT), status(TEXT: done|processing|error), create
 extraction_results: id(UUID), doc_id(UUID→documents.id), document_type(TEXT: invoice|contract|receipt|report|unknown), extracted_data(JSON), raw_text(TEXT)
 
 JSON FIELDS:
-invoice: invoice_number, vendor_name, total_amount, currency, issue_date, due_date, vat_amount
+invoice: invoice_number, vendor_name, customer_name, total_amount, currency, issue_date, due_date, vat_amount, line_items
 contract: parties, start_date, end_date, value, currency, key_clauses
 receipt: vendor_name, date, total_amount, currency
 report: title, author, date, summary
@@ -41,25 +35,51 @@ WRONG:   (r.extracted_data->>'total_amount')::numeric
 
 REGEXP_REPLACE removes ALL non-numeric characters including £, €, $, ¥, commas, spaces.
 Use this pattern for EVERY numeric cast in EVERY query.
+DATE RULES — CRITICAL — use the DOCUMENT'S ACTUAL DATE (issue_date), not upload time (d.created_at):
+- "this month", "last month", "this year", "last 30 days", "today",
+  "newest", "oldest", "latest", "earliest" → ALL refer to issue_date
+  (the date printed on the document), NOT d.created_at.
+- ONLY use d.created_at when the question explicitly says "uploaded",
+  "added to the system", "processed", "imported", or "scanned".
 
-NEVER do this:
-(r.extracted_data->>'field')::numeric
+ALWAYS use this exact mixed-format parsing pattern for issue_date:
 
-DATE RULES:
-today = CURRENT_DATE
-this week = d.created_at >= DATE_TRUNC('week', NOW())
-this month = d.created_at >= DATE_TRUNC('month', NOW())
-last month = d.created_at >= DATE_TRUNC('month', NOW()) - INTERVAL '1 month' AND d.created_at < DATE_TRUNC('month', NOW())
-last 30 days = d.created_at >= NOW() - INTERVAL '30 days'
-overdue = TO_DATE(r.extracted_data->>'due_date', 'DD Month YYYY') < CURRENT_DATE
-- "newest invoice/contract/receipt" → ORDER BY d.created_at DESC LIMIT 1
-- "oldest invoice/contract/receipt" → ORDER BY d.created_at ASC LIMIT 1
-- "latest invoice" → ORDER BY d.created_at DESC LIMIT 1
-- "earliest invoice" → ORDER BY d.created_at ASC LIMIT 1
-- NEVER use issue_date or any JSON date field for newest/oldest — always use d.created_at
-- NEVER use DISTINCT ON for single-record queries (LIMIT 1) — just use ORDER BY + LIMIT
-- When LIMIT 1, never add DISTINCT ON — it is unnecessary and causes errors
+  (
+    CASE
+      WHEN r.extracted_data->>'issue_date' ~ '^\d{{4}}-\d{{2}}-\d{{2}}$'
+        THEN TO_DATE(r.extracted_data->>'issue_date', 'YYYY-MM-DD')
+      WHEN r.extracted_data->>'issue_date' ~ '^\d{{1,2}}/\d{{1,2}}/\d{{4}}$'
+        THEN TO_DATE(r.extracted_data->>'issue_date', 'DD/MM/YYYY')
+      WHEN r.extracted_data->>'issue_date' ~ '^\d{{1,2}}\.\d{{1,2}}\.\d{{4}}$'
+        THEN TO_DATE(r.extracted_data->>'issue_date', 'DD.MM.YYYY')
+      WHEN r.extracted_data->>'issue_date' ~ '^\d{{1,2}} \w+ \d{{4}}$'
+        THEN TO_DATE(r.extracted_data->>'issue_date', 'DD Month YYYY')
+      ELSE NULL
+    END
+  )
 
+Write this CASE expression out IN FULL inline every time — never reference
+it as if it were a plain column.
+
+EXAMPLES (using PARSED_DATE to mean the full CASE expression above):
+- today = PARSED_DATE = CURRENT_DATE
+- this week = PARSED_DATE >= DATE_TRUNC('week', CURRENT_DATE)
+- this month = PARSED_DATE >= DATE_TRUNC('month', CURRENT_DATE)
+- last month = PARSED_DATE >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+               AND PARSED_DATE < DATE_TRUNC('month', CURRENT_DATE)
+- this year = PARSED_DATE >= DATE_TRUNC('year', CURRENT_DATE)
+- last 30 days = PARSED_DATE >= CURRENT_DATE - INTERVAL '30 days'
+
+NEWEST/OLDEST RULE:
+- "newest invoice/contract/receipt" / "latest" →
+  ORDER BY PARSED_DATE DESC NULLS LAST LIMIT 1
+- "oldest invoice/contract/receipt" / "earliest" →
+  ORDER BY PARSED_DATE ASC NULLS LAST LIMIT 1
+- For contracts, use start_date instead of issue_date in PARSED_DATE
+  (same CASE pattern, different field).
+- NEVER use DISTINCT ON for single-record queries (LIMIT 1) — just use
+  ORDER BY + LIMIT.
+- When LIMIT 1, never add DISTINCT ON — it is unnecessary and causes errors.
 SAFETY RULES:
 - Only SELECT queries
 - Never DELETE/UPDATE/INSERT/DROP/ALTER/TRUNCATE
@@ -75,6 +95,96 @@ ORDINAL QUERIES:
 - "second oldest"  → ORDER BY d.created_at ASC  OFFSET 1 LIMIT 1
 - Pattern: Nth item = OFFSET (N-1) LIMIT 1
 - NEVER use DISTINCT ON for these — use a subquery if needed
+OVERDUE + EXPIRING CROSS-DOC PATTERN:
+"overdue invoices from vendors who also have expiring contracts" →
+Primary result: overdue INVOICES (due_date < CURRENT_DATE)
+Filter: vendor must appear in a contract expiring within 30 days
+
+SELECT DISTINCT ON (d.filename) d.filename,
+    r.extracted_data->>'vendor_name' as vendor,
+    r.extracted_data->>'due_date' as due_date,
+    r.extracted_data->>'total_amount' as amount,
+    r.extracted_data->>'currency' as currency
+FROM documents d
+JOIN extraction_results r ON r.doc_id = d.id
+WHERE r.document_type = 'invoice'
+  AND d.status = 'done'
+  AND r.extracted_data->>'due_date' IS NOT NULL
+  AND (
+    CASE
+        WHEN r.extracted_data->>'due_date' ~ '^\d{{4}}-\d{{2}}-\d{{2}}$'
+        THEN TO_DATE(r.extracted_data->>'due_date', 'YYYY-MM-DD')
+        WHEN r.extracted_data->>'due_date' ~ '^\d{{1,2}}/\d{{1,2}}/\d{{4}}$'
+        THEN TO_DATE(r.extracted_data->>'due_date', 'DD/MM/YYYY')
+        WHEN r.extracted_data->>'due_date' ~ '^\d{{1,2}}\.\d{{1,2}}\.\d{{4}}$'
+        THEN TO_DATE(r.extracted_data->>'due_date', 'DD.MM.YYYY')
+        WHEN r.extracted_data->>'due_date' ~ '^\d{{1,2}} \w+ \d{{4}}$'
+        THEN TO_DATE(r.extracted_data->>'due_date', 'DD Month YYYY')
+        ELSE NULL
+    END
+  ) < CURRENT_DATE
+  AND EXISTS (
+    SELECT 1 FROM documents d2
+    JOIN extraction_results r2 ON r2.doc_id = d2.id
+    WHERE r2.document_type = 'contract'
+      AND d2.status = 'done'
+      AND r2.extracted_data->>'parties' ILIKE CONCAT('%', r.extracted_data->>'vendor_name', '%')
+      AND r2.extracted_data->>'end_date' IS NOT NULL
+      AND (
+        CASE
+            WHEN r2.extracted_data->>'end_date' ~ '^\d{{4}}-\d{{2}}-\d{{2}}$'
+            THEN TO_DATE(r2.extracted_data->>'end_date', 'YYYY-MM-DD')
+            WHEN r2.extracted_data->>'end_date' ~ '^\d{{1,2}}/\d{{1,2}}/\d{{4}}$'
+            THEN TO_DATE(r2.extracted_data->>'end_date', 'DD/MM/YYYY')
+            WHEN r2.extracted_data->>'end_date' ~ '^\d{{1,2}}\.\d{{1,2}}\.\d{{4}}$'
+            THEN TO_DATE(r2.extracted_data->>'end_date', 'DD.MM.YYYY')
+            WHEN r2.extracted_data->>'end_date' ~ '^\d{{1,2}} \w+ \d{{4}}$'
+            THEN TO_DATE(r2.extracted_data->>'end_date', 'DD Month YYYY')
+            ELSE NULL
+        END
+      ) BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days'
+  )
+ORDER BY d.filename LIMIT 200;
+COMBINED FILTER + DUPLICATE PATTERN:
+"Show [filtered] invoices, find duplicates, show [oldest/newest]" →
+Generate ONE SQL that returns ALL filtered invoices WITH a has_duplicate flag.
+NEVER filter out non-duplicates — always show all results with the flag.
+
+Example — "EUR invoices above 10000, find duplicates, show oldest":
+SELECT DISTINCT ON (d.filename) d.filename,
+    r.extracted_data->>'vendor_name' as vendor,
+    r.extracted_data->>'invoice_number' as invoice_number,
+    r.extracted_data->>'total_amount' as amount,
+    r.extracted_data->>'currency' as currency,
+    r.extracted_data->>'issue_date' as issue_date,
+    CASE WHEN r.extracted_data->>'invoice_number' IN (
+        SELECT r2.extracted_data->>'invoice_number'
+        FROM extraction_results r2
+        WHERE r2.document_type = 'invoice'
+          AND r2.extracted_data->>'invoice_number' IS NOT NULL
+        GROUP BY r2.extracted_data->>'invoice_number'
+        HAVING COUNT(*) > 1
+    ) THEN 'Yes' ELSE 'No' END as has_duplicate
+FROM documents d
+JOIN extraction_results r ON r.doc_id = d.id
+WHERE r.document_type = 'invoice'
+  AND d.status = 'done'
+  AND r.extracted_data->>'currency' = 'EUR'
+  AND NULLIF(REGEXP_REPLACE(r.extracted_data->>'total_amount','[^0-9.]','','g'),'')::numeric > 10000
+ORDER BY d.filename, d.created_at ASC
+LIMIT 200;
+
+This returns ALL 9 invoices. The has_duplicate column tells which ones are repeated.
+"oldest" → ORDER BY d.created_at ASC (first row is oldest)
+"newest" → ORDER BY d.created_at DESC
+
+Rules:
+- Filter goes in outer WHERE clause
+- Duplicate detection uses IN (subquery with HAVING COUNT(*) > 1)
+- "oldest" → ORDER BY d.created_at ASC
+- "newest" → ORDER BY d.created_at DESC
+- Currency filter: AND r.extracted_data->>'currency' = 'EUR'
+- Amount filter: AND NULLIF(REGEXP_REPLACE(...,'[^0-9.]','','g'),'')::numeric > X
 
 DEDUPLICATION RULE (ALWAYS apply):
 - Use DISTINCT ON (d.filename) for list queries
@@ -87,6 +197,60 @@ CONTRACT VENDOR RULE — CRITICAL:
 - Never use extracted_data->>'vendor_name' for contracts
 - For invoices/receipts use: extracted_data->>'vendor_name'
 - For contracts use: extracted_data->>'parties' ILIKE '%name%'
+
+MONTHLY TREND RULE — CRITICAL (universal for any vendor/currency):
+- "monthly trend", "trend over time", "trend for [vendor]" →
+  ALWAYS a single GROUP BY query using issue_date (never d.created_at)
+- Use this exact mixed-format date parsing pattern:
+
+  DATE_TRUNC('month',
+    CASE
+      WHEN r.extracted_data->>'issue_date' ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$'
+        THEN TO_DATE(r.extracted_data->>'issue_date', 'YYYY-MM-DD')
+      WHEN r.extracted_data->>'issue_date' ~ '^\\d{{1,2}}/\\d{{1,2}}/\\d{{4}}$'
+        THEN TO_DATE(r.extracted_data->>'issue_date', 'DD/MM/YYYY')
+      WHEN r.extracted_data->>'issue_date' ~ '^\\d{{1,2}} \\w+ \\d{{4}}$'
+        THEN TO_DATE(r.extracted_data->>'issue_date', 'DD Month YYYY')
+      ELSE NULL
+    END
+  ) AS month
+
+- ALWAYS select BOTH: COUNT(*) as invoice_count AND ROUND(SUM(amount),2) as total_amount
+- ALWAYS add: AND r.extracted_data->>'issue_date' IS NOT NULL (prevents NULL month rows)
+- If a vendor is mentioned: AND r.extracted_data->>'vendor_name' ILIKE '%[vendor]%'
+- GROUP BY month ORDER BY month ASC (chronological order, oldest first)
+- Example:
+  SELECT
+    DATE_TRUNC('month', CASE
+      WHEN r.extracted_data->>'issue_date' ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$'
+        THEN TO_DATE(r.extracted_data->>'issue_date', 'YYYY-MM-DD')
+      ELSE NULL
+    END) as month,
+    COUNT(*) as invoice_count,
+    ROUND(SUM(NULLIF(REGEXP_REPLACE(r.extracted_data->>'total_amount','[^0-9.]','','g'),'')::numeric), 2) as total_amount
+  FROM documents d JOIN extraction_results r ON r.doc_id = d.id
+  WHERE r.document_type = 'invoice' AND d.status = 'done'
+  AND r.extracted_data->>'vendor_name' ILIKE '%BrightPath Analytics%'
+  AND r.extracted_data->>'issue_date' IS NOT NULL
+  GROUP BY month ORDER BY month ASC;
+
+ORDINAL RANKING RULE — works for ANY ordinal, ANY metric, ANY language:
+"Nth highest/most/largest X" → ORDER BY metric DESC LIMIT 1 OFFSET (N-1)
+"Nth lowest/least/smallest X" → ORDER BY metric ASC LIMIT 1 OFFSET (N-1)
+
+Example — "second most invoices per vendor":
+SELECT r.extracted_data->>'vendor_name' as vendor, COUNT(*) as cnt
+FROM documents d JOIN extraction_results r ON r.doc_id = d.id
+WHERE r.document_type = 'invoice' AND d.status = 'done'
+GROUP BY vendor ORDER BY cnt DESC LIMIT 1 OFFSET 1;
+
+Example — "third highest spending vendor":
+SELECT r.extracted_data->>'vendor_name' as vendor, SUM(NULLIF(REGEXP_REPLACE(r.extracted_data->>'total_amount','[^0-9.]','','g'),'')::numeric) as total
+FROM documents d JOIN extraction_results r ON r.doc_id = d.id
+WHERE r.document_type = 'invoice' AND d.status = 'done'
+GROUP BY vendor ORDER BY total DESC LIMIT 1 OFFSET 2;
+
+This is a general rule — never hardcode specific ordinal words; compute OFFSET as (position - 1) for whatever ordinal the user asks for.
 
 VENDOR TOTAL RULE:
 - When asking "which vendor paid most" or "top vendor" — GROUP BY vendor only, NOT by currency
@@ -101,23 +265,37 @@ DOCUMENT TYPE RULE — CRITICAL:
 - "show contracts" → WHERE r.document_type = 'contract'
 - "show invoices" → WHERE r.document_type = 'invoice'
 - NEVER mix document types unless user asks for "all documents"
-
-DOCUMENT COUNT RULE:
-- "invoice count by document type" or "count by type" → 
-  Remove document_type filter, GROUP BY document_type
-  SELECT r.document_type, COUNT(*) as count FROM documents d JOIN extraction_results r ON r.doc_id = d.id WHERE d.status = 'done' GROUP BY r.document_type ORDER BY count DESC;
-
 VENDOR SEARCH RULE:
 - Always use ILIKE '%name%' not = 'name' for vendor searches
 - This catches BrightPath Analytics AND BrightPath Analytics Ltd together
 - Example: LOWER(r.extracted_data->>'vendor_name') LIKE LOWER('%BrightPath%')
-
+CUSTOMER NAME RULE:
+- vendor_name = company that issued the invoice (seller)
+- customer_name = company that received the invoice (buyer)
+- "invoices sent to Acme" → WHERE extracted_data->>'customer_name' ILIKE '%Acme%'
+- "invoices from BrightPath" → WHERE extracted_data->>'vendor_name' ILIKE '%BrightPath%'
+- "what did we buy from X" → use vendor_name
+- "who did we sell to" → use customer_name
 OVERDUE DATE RULE — CRITICAL:
 Dates are stored in mixed formats: YYYY-MM-DD, DD/MM/YYYY, DD Month YYYY
 Use this safe pattern that handles all formats:
 
+-- Most expensive / high-value contracts
+SELECT DISTINCT ON (d.filename) d.filename,
+       r.extracted_data->>'parties' as parties,
+       NULLIF(REGEXP_REPLACE(r.extracted_data->>'value','[^0-9.]','','g'),'')::numeric as value,
+       r.extracted_data->>'currency' as currency
+FROM documents d
+JOIN extraction_results r ON r.doc_id = d.id
+WHERE r.document_type = 'contract' AND d.status = 'done'
+AND r.extracted_data->>'value' IS NOT NULL
+ORDER BY d.filename, value DESC
+LIMIT 10;
+
 TOTAL AMOUNT RULE — CRITICAL:
-- "total amount of all invoices" or "total invoices" or "how much total" →
+- ANY question about total spending/money/payments without a specific currency
+  ("how much did we spend", "how much money", "what did we spend",
+  "total invoices", "how much total", "total spending", "how much have we paid") 
   NEVER sum across currencies — always GROUP BY currency
   SELECT r.extracted_data->>'currency' as currency,
          ROUND(SUM(NULLIF(REGEXP_REPLACE(r.extracted_data->>'total_amount','[^0-9.]','','g'),'')::numeric), 2) as total_amount
@@ -237,9 +415,6 @@ SELECT r.extracted_data->>'vendor_name' as vendor, COUNT(*) as invoice_count, RO
 -- Document type distribution
 SELECT r.document_type, COUNT(*) as count, ROUND(COUNT(*)*100.0/SUM(COUNT(*))OVER(), 1) as percentage FROM documents d JOIN extraction_results r ON r.doc_id = d.id WHERE d.status = 'done' GROUP BY r.document_type ORDER BY count DESC;
 
--- What document types exist (GROUP BY, never DISTINCT ON)
-SELECT r.document_type, COUNT(*) as count, ROUND(COUNT(*)*100.0/SUM(COUNT(*))OVER(), 1) as percentage FROM documents d JOIN extraction_results r ON r.doc_id = d.id WHERE d.status = 'done' GROUP BY r.document_type ORDER BY count DESC;
-
 -- Highest invoices
 SELECT d.filename, r.extracted_data->>'vendor_name' as vendor, NULLIF(REPLACE(r.extracted_data->>'total_amount',',',''),'')::numeric as amount, r.extracted_data->>'currency' as currency FROM documents d JOIN extraction_results r ON r.doc_id = d.id WHERE r.document_type = 'invoice' AND d.status = 'done' ORDER BY amount DESC NULLS LAST LIMIT 10;
 
@@ -293,9 +468,6 @@ SELECT DISTINCT ON (d.filename) d.filename, r.extracted_data->>'parties' as part
 
 -- All contracts
 SELECT DISTINCT ON (d.filename) d.filename, r.extracted_data->>'parties' as parties, r.extracted_data->>'value' as value, r.extracted_data->>'currency' as currency FROM documents d JOIN extraction_results r ON r.doc_id = d.id WHERE r.document_type = 'contract' AND d.status = 'done' ORDER BY d.filename LIMIT 200;
-
--- Total amount of all invoices
-SELECT ROUND(SUM(NULLIF(REPLACE(r.extracted_data->>'total_amount',',',''),'')::numeric), 2) as total_amount FROM documents d JOIN extraction_results r ON r.doc_id = d.id WHERE r.document_type = 'invoice' AND d.status = 'done';
 
 -- Largest single invoice from a specific vendor
 SELECT d.filename,
@@ -465,7 +637,10 @@ def fix_vendor_canonical_names(sql: str, all_vendors: list) -> str:
         return sql
 
     from services.vendor_matcher import find_matches, similarity
-
+    CURRENCY_CODES = {
+        "EUR", "USD", "GBP", "JPY", "CHF", "INR", 
+        "CAD", "AUD", "CNY", "SEK", "NOK", "DKK"
+    }
     def replace_vendor(match_str):
         # Extract the quoted string value
         quoted = re.findall(r"'([^']+)'", match_str)
@@ -475,6 +650,9 @@ def fix_vendor_canonical_names(sql: str, all_vendors: list) -> str:
         result = match_str
         for name in quoted:
             if len(name) < 3:
+                continue
+            # ── Never replace currency codes ──
+            if name.upper() in CURRENCY_CODES:
                 continue
             # Skip if already an exact canonical match
             if name in all_vendors:
@@ -498,10 +676,28 @@ def fix_vendor_canonical_names(sql: str, all_vendors: list) -> str:
         flags=re.IGNORECASE
     )
 
-    # Fix ILIKE '%name%' clauses
+    # Fix ILIKE '%name%' clauses — preserve the % wildcards
+    def replace_ilike_vendor(match):
+        full = match.group(0)
+        inner = re.search(r"'%([^']+)%'", full)
+        if not inner:
+            return full
+        name = inner.group(1)
+        if name in all_vendors:
+            return full
+        fuzzy = find_matches(name, all_vendors, threshold=0.55)
+        substring = [v for v in all_vendors if name.lower() in v.lower()]
+        candidates = list({*fuzzy, *substring})
+        if candidates:
+            best = max(candidates, key=lambda v: similarity(name, v))
+            if best.lower() != name.lower():
+                logger.info(f"fix_vendor_canonical: ILIKE '%{name}%' → '%{best}%'")
+                return f"ILIKE '%{best}%'"
+        return full
+
     sql = re.sub(
         r"ILIKE\s*'%[^']+%'",
-        lambda m: replace_vendor(m.group(0)),
+        replace_ilike_vendor,
         sql,
         flags=re.IGNORECASE
     )
@@ -715,6 +911,304 @@ LIMIT 1;"""
     logger.info(f"fix_subquery_to_cte: rewrote broken JOIN-subquery to CTE, direction={direction}")
     return fixed
 
+def fix_missing_join_on(sql: str) -> str:
+    """
+    Fix missing ON clause in JOIN statements.
+    JOIN documents d2 JOIN extraction_results r2 ON r2.doc_id = d2.id
+    → JOIN documents d2 ON d2.id = r1.doc_id JOIN extraction_results r2 ON r2.doc_id = d2.id
+    
+    Universal: detects any JOIN without ON and adds the standard doc_id linkage.
+    """
+    # Pattern: JOIN table alias\nJOIN (missing ON between them)
+    fixed = re.sub(
+        r'JOIN\s+(documents|extraction_results)\s+(\w+)\s*\n\s*JOIN',
+        lambda m: f'JOIN {m.group(1)} {m.group(2)} ON {m.group(2)}.id = r1.doc_id\nJOIN',
+        sql,
+        flags=re.IGNORECASE
+    )
+    if fixed != sql:
+        logger.info("fix_missing_join_on: added missing ON clause to JOIN")
+    return fixed
+
+def fix_jsonb_cast(sql: str) -> str:
+    """
+    Fix all JSONB ->> cast issues universally:
+    1. r.extracted_data->>'field'::text  → (r.extracted_data->>'field')::text
+    2. field ILIKE '%' || expr::text || '%'  → ILIKE CONCAT('%', expr, '%')
+    3. field ILIKE '%' || expr || '%'  → ILIKE CONCAT('%', expr, '%')
+    Avoids asyncpg type inference issues with || and ::text on JSONB results.
+    """
+    # Fix: any ->> expression followed by ::type cast — wrap in parens
+    sql = re.sub(
+        r"(\w+\.extracted_data->>'[^']+')\s*::(\w+)",
+        r"(\1)::\2",
+        sql,
+        flags=re.IGNORECASE
+    )
+
+    # Fix: ILIKE '%' || any_expr::text || '%' → ILIKE CONCAT('%', any_expr, '%')
+    sql = re.sub(
+        r"ILIKE\s+'%'\s*\|\|\s*(.+?)\s*\|\|\s*'%'",
+        lambda m: f"ILIKE CONCAT('%', {m.group(1).strip()}, '%')",
+        sql,
+        flags=re.IGNORECASE
+    )
+
+    # Fix: ILIKE '%' + (subquery) + '%' → ILIKE CONCAT('%', (subquery), '%')
+    sql = re.sub(
+        r"ILIKE\s*'%'\s*\+\s*(\(SELECT[^)]+\))\s*\+\s*'%'",
+        lambda m: f"ILIKE CONCAT('%', {m.group(1)}, '%')",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+
+    # Fix: ILIKE '%' + expr + '%' (non-subquery) → ILIKE CONCAT('%', expr, '%')
+    sql = re.sub(
+        r"ILIKE\s*'%'\s*\+\s*(.+?)\s*\+\s*'%'",
+        lambda m: f"ILIKE CONCAT('%', {m.group(1).strip()}, '%')",
+        sql,
+        flags=re.IGNORECASE
+    )
+
+    if "CONCAT" in sql.upper() or ")::" in sql:
+        logger.info("fix_jsonb_cast: applied JSONB cast corrections")
+    return sql
+
+def fix_cross_document_exists(sql: str, question: str = "") -> str:
+    """
+    Universal fix for cross-document queries (contracts from vendors who also 
+    sent invoices above X, or invoices from vendors who also have contracts, etc).
+    
+    The LLM typically generates a broken IN(SELECT...) or JOIN pattern that 
+    fails because parties is a JSON array. This detects any cross-document
+    query involving both invoice and contract document types and rewrites
+    to the correct EXISTS + ILIKE CONCAT pattern.
+
+    CRITICAL: "but not in" / "without" / "exclude" intent must be detected
+    from the ORIGINAL QUESTION, not the generated SQL — English phrases
+    like "but not in invoices" never appear inside SQL code, only in the
+    user's natural language question.
+    
+    Works for any amount, any threshold direction, any document type combination.
+    """
+    sql_lower = sql.lower()
+    question_lower = (question or "").lower()
+    # Never rewrite aggregation queries (GROUP BY vendor)
+    if "group by" in sql_lower:
+        return sql
+    # Only applies to cross-document queries
+    if "invoice" not in sql_lower or "contract" not in sql_lower:
+        return sql
+    # Only rewrite if there's an actual amount condition — not generic cross-doc queries
+    has_amount_condition = bool(re.search(r'\d+', sql)) and any(
+        k in sql_lower for k in [">", "<", ">=", "<=", "above", "over", "more than"]
+    )
+    if not has_amount_condition:
+        return sql
+
+    # Don't rewrite if SQL already has a specific vendor/parties filter
+    if "ilike" in sql_lower and "parties" in sql_lower:
+        existing_ilike = re.search(r"parties.*?ilike\s*'%([^%]+)%'", sql_lower)
+        if existing_ilike:
+            return sql  # already has specific vendor filter
+    
+    # Already correct or uses NOT EXISTS (don't flip the logic)
+    if "exists" in sql_lower and "concat" in sql_lower:
+        return sql
+    if "not exists" in sql_lower:
+        return sql
+    if "not in" in sql_lower and "exists" in sql_lower:
+        return sql
+        
+    # Already handled by fix_cross_document_vendor_match
+    if "exists" in sql_lower and "vendor_name" in sql_lower and "parties" in sql_lower:
+        return sql
+
+    # ── Detect NOT EXISTS intent — checked against the QUESTION ──
+    not_exists_patterns = [
+        r'\bnot\s+in\s+invoices\b',
+        r'\bnot\s+in\s+contracts\b',
+        r'\bbut\s+not\s+in\b',
+        r'\bwithout\s+invoices\b',
+        r'\bwithout\s+contracts\b',
+        r'\bno\s+invoices\b',
+        r'\bno\s+contracts\b',
+        r'\bnever\s+invoiced\b',
+        r'\bnot\s+appear\s+in\b',
+        r'\bdon\'t\s+have\s+invoices\b',
+        r'\bdo\s+not\s+have\s+invoices\b',
+        r'\bdon\'t\s+have\s+contracts\b',
+        r'\bdo\s+not\s+have\s+contracts\b',
+        r'\bexclude\b',
+        r'\bnot\s+found\s+in\b',
+        r'\bonly\s+in\s+contracts\b',
+        r'\bonly\s+in\s+invoices\b',
+        r'\bmissing\s+from\b',
+        r'\bnot\s+also\b',
+    ]
+    # Search the question if we have it, otherwise fall back to SQL as before
+    search_text = question_lower if question_lower else sql_lower
+    use_not_exists = any(
+        re.search(p, search_text, re.IGNORECASE)
+        for p in not_exists_patterns
+    )
+    exists_keyword = "NOT EXISTS" if use_not_exists else "EXISTS"
+
+    # Extract amount threshold if present
+    amount_match = re.search(
+        r'(?:>|>=|<|<=)\s*(\d+(?:\.\d+)?)|'
+        r'(?:above|over|more than|greater than|exceeding|at least)\s+(\d+(?:\.\d+)?)',
+        sql, re.IGNORECASE
+    )
+    
+    direction = ">"
+    if amount_match:
+        if re.search(r'(?:<|<=|less than|below|under)', sql, re.IGNORECASE):
+            direction = "<"
+    
+    amount = None
+    if amount_match:
+        amount = amount_match.group(1) or amount_match.group(2)
+
+    currency_match = re.search(
+        r"currency\s*=\s*'([A-Z]{3})'|'([A-Z]{3})'",
+        sql, re.IGNORECASE
+    )
+    currency_filter = ""
+    if currency_match:
+        currency = currency_match.group(1) or currency_match.group(2)
+        if currency in ("EUR", "USD", "GBP", "JPY", "CHF", "INR", "CAD", "AUD"):
+            currency_filter = f"AND r2.extracted_data->>'currency' = '{currency}'"
+
+    wants_contracts = bool(re.search(
+        r"document_type\s*=\s*'contract'", sql[:len(sql)//2], re.IGNORECASE
+    ))
+    
+    if wants_contracts:
+        primary_type = "contract"
+        filter_type = "invoice"
+        primary_fields = """d.filename,
+            r.extracted_data->>'parties' as parties,
+            r.extracted_data->>'value' as value,
+            r.extracted_data->>'currency' as currency"""
+        link_condition = "r.extracted_data->>'parties' ILIKE CONCAT('%', r2.extracted_data->>'vendor_name', '%')"
+    else:
+        primary_type = "invoice"
+        filter_type = "contract"
+        primary_fields = """d.filename,
+            r.extracted_data->>'vendor_name' as vendor,
+            r.extracted_data->>'total_amount' as amount,
+            r.extracted_data->>'currency' as currency"""
+        link_condition = "r2.extracted_data->>'parties' ILIKE CONCAT('%', r.extracted_data->>'vendor_name', '%')"
+
+    if amount:
+        amount_filter = f"""AND NULLIF(REGEXP_REPLACE(r2.extracted_data->>'total_amount', '[^0-9.]', '', 'g'), '')::numeric {direction} {amount}"""
+    else:
+        amount_filter = ""
+
+    fixed = f"""SELECT DISTINCT ON (d.filename)
+    {primary_fields}
+FROM documents d
+JOIN extraction_results r ON r.doc_id = d.id
+WHERE r.document_type = '{primary_type}'
+AND d.status = 'done'
+AND {exists_keyword} (
+    SELECT 1
+    FROM documents d2
+    JOIN extraction_results r2 ON r2.doc_id = d2.id
+    WHERE r2.document_type = '{filter_type}'
+    AND d2.status = 'done'
+    {amount_filter}
+    {currency_filter}
+    AND {link_condition}
+)
+ORDER BY d.filename, d.created_at DESC
+LIMIT 200"""
+
+    logger.info(f"fix_cross_document_exists: rewrote cross-document query "
+                f"primary={primary_type} filter={filter_type} amount={amount} "
+                f"dir={direction} exists={exists_keyword}")
+    return fixed
+
+# def fix_cross_document_vendor_match(sql: str) -> str:
+#     """
+#     Detect IN(SELECT parties...) pattern and rewrite to EXISTS+ILIKE.
+#     The actual ILIKE cast fix is handled by fix_jsonb_cast.
+#     """
+#     sql_lower = sql.lower()
+#     if "invoice" not in sql_lower or "contract" not in sql_lower:
+#         return sql
+#     if "parties" not in sql_lower or "vendor_name" not in sql_lower:
+#         return sql
+#     if "EXISTS" in sql.upper():
+#         return sql  # already correct structure, fix_jsonb_cast handles the rest
+#     if "IN" not in sql.upper():
+#         return sql
+
+#     logger.info("fix_cross_document: rewriting IN(SELECT parties) to EXISTS+ILIKE")
+#     return """SELECT DISTINCT r1.extracted_data->>'vendor_name' AS vendor
+# FROM extraction_results r1
+# JOIN documents d1 ON r1.doc_id = d1.id
+# WHERE r1.document_type = 'invoice'
+# AND d1.status = 'done'
+# AND r1.extracted_data->>'vendor_name' IS NOT NULL
+# AND EXISTS (
+#   SELECT 1
+#   FROM extraction_results r2
+#   JOIN documents d2 ON r2.doc_id = d2.id
+#   WHERE r2.document_type = 'contract'
+#   AND d2.status = 'done'
+#   AND r2.extracted_data->>'parties' ILIKE '%' || r1.extracted_data->>'vendor_name' || '%'
+# )
+# ORDER BY vendor
+# LIMIT 200"""
+
+# def fix_cross_document_amount_filter(sql: str) -> str:
+#     """
+#     Fix queries like "contracts from vendors who also sent invoices above X"
+#     These need EXISTS subquery joining invoices with amount filter.
+#     Universal — works for any amount threshold.
+#     """
+#     sql_lower = sql.lower()
+#     if "contract" not in sql_lower or "invoice" not in sql_lower:
+#         return sql
+#     if "exists" in sql_lower:
+#         return sql  # already correct
+
+#     # Detect amount threshold from SQL
+#     amount_match = re.search(r'(\d+(?:\.\d+)?)', sql)
+#     if not amount_match:
+#         return sql
+
+#     amount = amount_match.group(1)
+
+#     # Check if this looks like a cross-document filter
+#     if "parties" not in sql_lower:
+#         return sql
+
+#     logger.info(f"fix_cross_document_amount: rewriting to EXISTS with amount > {amount}")
+
+#     return f"""SELECT DISTINCT ON (d.filename)
+#     d.filename,
+#     r.extracted_data->>'parties' as parties,
+#     r.extracted_data->>'value' as value,
+#     r.extracted_data->>'currency' as currency
+# FROM documents d
+# JOIN extraction_results r ON r.doc_id = d.id
+# WHERE r.document_type = 'contract'
+# AND d.status = 'done'
+# AND EXISTS (
+#     SELECT 1
+#     FROM documents d2
+#     JOIN extraction_results r2 ON r2.doc_id = d2.id
+#     WHERE r2.document_type = 'invoice'
+#     AND d2.status = 'done'
+#     AND NULLIF(REGEXP_REPLACE(r2.extracted_data->>'total_amount', '[^0-9.]', '', 'g'), '')::numeric > {amount}
+#     AND r.extracted_data->>'parties' ILIKE CONCAT('%', r2.extracted_data->>'vendor_name', '%')
+# )
+# ORDER BY d.filename, d.created_at DESC
+# LIMIT 200"""
+
 def generate_sql(
     question: str,
     history: str = "",
@@ -726,15 +1220,15 @@ def generate_sql(
     amount_ref = context.get("amount_reference", "0") or "0"
 
     try:
-        chain = SQL_PROMPT | llm
-        result = chain.invoke({
-            "question": question,
-            "history": history or "No history",
-            "resolved_context": str(context),
-            "amount_reference": amount_ref
-        })
-
-        sql = result.content.strip()
+        sql = invoke_with_fallback(
+            lambda llm: SQL_PROMPT | llm,
+            {
+                "question": question,
+                "history": history or "No history",
+                "resolved_context": str(context),
+                "amount_reference": amount_ref
+            }
+        )
 
         # Clean markdown fences
         if "```" in sql:
@@ -743,12 +1237,17 @@ def generate_sql(
             if sql.lower().startswith("sql"):
                 sql = sql[3:]
         sql = sql.strip()
+        sql = fix_missing_join_on(sql)
+        sql = fix_jsonb_cast(sql)
         sql = fix_distinct_order_conflict(sql)
         sql = fix_vendor_exact_match(sql) 
         if all_vendors:
             sql = fix_vendor_canonical_names(sql, all_vendors)
         sql = fix_missing_currency_filter(sql, question)
         sql = fix_nullif_syntax(sql)
+        sql = fix_cross_document_exists(sql, question)
+        # sql = fix_cross_document_vendor_match(sql)
+        # sql = fix_cross_document_amount_filter(sql)
         sql = fix_subquery_to_cte(sql) 
         sql = fix_outer_subquery_references(sql)
 

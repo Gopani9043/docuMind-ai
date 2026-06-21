@@ -1,18 +1,19 @@
 import os
 import json
 import logging
-from langchain_groq import ChatGroq
-from langchain.prompts import ChatPromptTemplate
+# from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
+from chatbot.llm_provider import invoke_with_fallback
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-llm = ChatGroq(
-    api_key=os.getenv("GROQ_API_KEY"),
-    model_name=os.getenv("LLM_MODEL", "llama-3.1-8b-instant"),
-    temperature=0,
-)
+# llm = ChatGroq(
+#     api_key=os.getenv("GROQ_API_KEY"),
+#     model_name=os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
+#     temperature=0,
+# )
 
 REWRITE_PROMPT = ChatPromptTemplate.from_template("""
 You are a query rewriter for a document analytics chatbot.
@@ -121,7 +122,7 @@ VAGUE_INDICATORS = [
     "show me the invoice", "show me that", "which one",
     "when was it", "when was it uploaded", "show related",
     "is this", "what invoice", "what contract",
-    "how many times", "repeat", "how often", "appear",
+    "how many times", "repeat", "how often",
     "next one", "previous one",         # removed "the second", "the third"
     "show them", "list them", "what currency", "how much",
     "give me", "vendor name", "this invoice", "this vendor",
@@ -192,17 +193,37 @@ def rewrite_query(
     if not needs_rewrite:
         return question
 
+    # ── Never rewrite if question contains a specific entity name ──
+    # Catches "Does CloudPeak appear...", "Does dhruv appear...", etc.
+    common_question_words = {
+        "does", "is", "are", "which", "what", "show", "find", "appear",
+        "in", "contracts", "invoices", "too", "also", "the", "a", "an",
+        "and", "or", "not", "any", "have", "has", "do", "can", "where",
+        "when", "how", "both", "receipts", "documents", "reports"
+    }
+    question_words = question.strip("?.,!").split()
+    entity_words = [
+        w for i, w in enumerate(question_words)
+        if w.strip("?.,!:;").lower() not in common_question_words
+        and len(w.strip("?.,!:;")) > 2
+        and i > 0
+    ]
+    if entity_words:
+        logger.info(f"Entity detected {entity_words} — skipping rewrite, fresh query")
+        return question
+
     try:
         context_str = json.dumps(resolved_context) if resolved_context else "{}"
 
-        chain = REWRITE_PROMPT | llm
-        result = chain.invoke({
-            "question": question,
-            "history": history,
-            "last_results": str(last_metadata.get("results_sample", []))[:400],
-            "resolved_context": context_str
-        })
-        rewritten = result.content.strip()
+        rewritten = invoke_with_fallback(
+            lambda llm: REWRITE_PROMPT | llm,
+            {
+                "question": question,
+                "history": history,
+                "last_results": str(last_metadata.get("results_sample", []))[:400],
+                "resolved_context": context_str
+            }
+        )
 
         if not rewritten or len(rewritten) < 5:
             return question

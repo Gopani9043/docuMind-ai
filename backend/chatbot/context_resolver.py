@@ -1,19 +1,19 @@
 import os
 import json
 import logging
-from langchain_groq import ChatGroq
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 from services.vendor_matcher import normalize
-
+from chatbot.llm_provider import invoke_with_fallback
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-llm = ChatGroq(
-    api_key=os.getenv("GROQ_API_KEY"),
-    model_name=os.getenv("LLM_MODEL", "llama-3.1-8b-instant"),
-    temperature=0,
-)
+
+# llm = ChatGroq(
+#     api_key=os.getenv("GROQ_API_KEY"),
+#     model_name=os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
+#     temperature=0,
+# )
 
 CONTEXT_PROMPT = ChatPromptTemplate.from_template("""
 You are a context resolver for a document analytics chatbot.
@@ -100,7 +100,7 @@ VAGUE_TERMS = [
     "same", "similar", "previous", "above", "that average",
     "closest", "nearest", "compared", "the one",
     # ── follow-up navigation ──
-    "how many times", "repeat", "how often", "appear",
+    "how many times", "repeat", "how often",
     "the second", "the third", "the fourth", "the last", "the first",
     "show them", "list them", "newest", "oldest", "latest",
     "what currency", "when was it", "which one", "that vendor",
@@ -140,6 +140,16 @@ def resolve_context(
         "conversation_focus": None,
         "resolved_references": None
     }
+
+    # ── Bare/contentless command — never inherit any context ──────────────────
+    # "Show", "List", "Get" alone have zero referential content; inheriting
+    # vendor/currency/amount from stale results causes hallucinated transforms.
+    bare_command_words = {"show", "list", "display", "get", "find", "fetch", "give"}
+    q_tokens = [t for t in question.lower().strip("?.,! ").split() if t]
+    if len(q_tokens) <= 1 and (not q_tokens or q_tokens[0] in bare_command_words):
+        logger.info(f"Bare command '{question}' — returning clean context, no inheritance")
+        return default_context
+
 
     # ── Fast rule-based resolution — no LLM needed ───────────────────────────
     q_lower = question.lower()
@@ -231,7 +241,51 @@ def resolve_context(
     needs_llm = any(term in q_lower for term in VAGUE_TERMS)
     if not needs_llm:
         return default_context
- 
+
+    # ── Fast path: question contains a proper noun entity — always fresh query ─
+    # Detects "Does CloudPeak appear...", "Is BrightPath in...", etc.
+    # A proper noun sequence = 1+ consecutive capitalized words not at sentence start
+    words = question.split()
+    proper_nouns = []
+    for i, w in enumerate(words):
+        clean = w.strip("?.,!:;")
+        if i > 0 and clean and clean[0].isupper() and len(clean) > 2:
+            proper_nouns.append(clean)
+
+    if proper_nouns:
+        # Check if any proper noun looks like a vendor (not a common word)
+        common_caps = {"Does", "Is", "Are", "Which", "What", "Show", "Find",
+                       "Compare", "Who", "When", "Where", "How", "Can", "Do",
+                       "Have", "Has", "The", "This", "That", "These", "Those"}
+        vendor_like = [w for w in proper_nouns if w not in common_caps]
+
+        # Also catch lowercase potential names (e.g. "dhruv", "tesla")
+        q_words = question.strip("?.,!").split()
+        stopwords_lower = {"does", "is", "are", "which", "what", "show", "find",
+                          "appear", "in", "contracts", "invoices", "too", "also",
+                          "the", "a", "an", "and", "or", "not", "any", "have",
+                          "has", "do", "can", "where", "when", "how", "both"}
+        for i, w in enumerate(q_words):
+            clean = w.strip("?.,!:;").lower()
+            if i > 0 and clean not in stopwords_lower and len(clean) > 2:
+                if not clean[0].isupper():  # lowercase word
+                    vendor_like.append(w)
+
+        if vendor_like:
+            logger.info(f"Fast path: proper noun entity detected {vendor_like} — fresh query")
+            # Clear ALL inherited context — this is a fresh entity question
+            return {
+                "document_type": None,
+                "vendor_name": None,
+                "currency": None,
+                "amount_reference": None,
+                "time_period": None,
+                "comparison_requested": False,
+                "previous_query_type": None,
+                "intent_override": None,
+                "conversation_focus": None,
+                "resolved_references": None
+            }
     # ── Fast path: fresh analytical queries — never list_navigation ──────────
     # These always need a new SQL query, never navigate a cached list
     fresh_query_patterns = [
@@ -263,16 +317,16 @@ def resolve_context(
         # Pass conversation focus — universal topic tracking
         focus_str = json.dumps(conversation_focus) if conversation_focus else "{}"
 
-        chain = CONTEXT_PROMPT | llm
-        response = chain.invoke({
-            "question": question,
-            "history": history,
-            "last_query_type": last_query_type,
-            "last_results": results_str,
-            "conversation_focus": focus_str
-        })
-
-        content = response.content.strip()
+        content = invoke_with_fallback(
+            lambda llm: CONTEXT_PROMPT | llm,
+            {
+                "question": question,
+                "history": history,
+                "last_query_type": last_query_type,
+                "last_results": results_str,
+                "conversation_focus": focus_str
+            }
+        )
 
         # Clean markdown fences if present
         if "```" in content:
