@@ -6,6 +6,7 @@ from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 from langdetect import detect
+from chatbot.llm_provider import invoke_with_fallback
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -277,9 +278,10 @@ def extract_structured_data(raw_text: str) -> dict:
         lang = detect_language(raw_text)
         prompt = GERMAN_PROMPT if lang == "de" else ENGLISH_PROMPT
 
-        chain = prompt | llm
-        response = chain.invoke({"text": raw_text[:8000]})
-        content = response.content.strip()
+        content = invoke_with_fallback(
+            lambda llm_instance: prompt | llm_instance,
+            {"text": raw_text[:8000]}
+        )
 
         # Strip markdown fences
         if content.startswith("```"):
@@ -291,8 +293,8 @@ def extract_structured_data(raw_text: str) -> dict:
 
         content = content.strip()
 
-        if not content:
-            logger.warning("LLM returned empty content")
+        if not content or not content.strip(" \t\n\r\ufeff\xa0"):
+            logger.warning("LLM returned empty or whitespace-only content")
             return {
                 "document_type": "unknown",
                 "extracted_data": {},
