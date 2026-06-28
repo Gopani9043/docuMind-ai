@@ -401,7 +401,7 @@ SYNONYMS:
 invoice = bill|rechnung|faktura
 contract = agreement|vertrag
 receipt = kassenbon|payment
-vendor = supplier|seller|company
+vendor = supplier|seller|company|lieferant
 amount = value|cost|price|total
 
 EXAMPLE QUERIES:

@@ -21,7 +21,8 @@ Return ONLY valid JSON:
   "tier": "high | medium | low | null",
   "compare_items": [<name fragments mentioned, or empty list>],
   "show_month": true or false,
-  "metric": "amount | count"
+  "metric": "amount | count",
+  "scope": "invoice | contract"
 }}
 
 RULES:
@@ -32,7 +33,11 @@ RULES:
 - "second least" / "second smallest" / "second safest" → single_rank, rank_position=-2
 - "top N" (N is a number) → top_n, n=N
 - "bottom N" / "lowest N" / "smallest N" → bottom_n, n=N
-- "medium" / "average" / "moderate" / "middle" → average
+- "medium" / "average" / "moderate" / "middle" / "closest to average" /
+  "closest to the average" → average (a SINGLE item, the one nearest
+  the mean — NOT a tier/category)
+- "medium tier" / "moderate tier" / "categorize as medium" → tier, tier="medium"
+  (a GROUP of items, distinct from the single-item "average" case above)
 - "above average" / "high tier" → tier, tier="high"
 - "below average" / "low tier" → tier, tier="low"
 - "high/medium/low" categorization request → tier, tier=<high|medium|low>
@@ -67,6 +72,10 @@ METRIC RULE — decide by MEANING, not by keyword presence:
   "number of invoices", "most invoices received".
 - Default to metric="amount" when genuinely ambiguous, since most
   business questions about "highest/biggest X" refer to value.
+
+- scope="contract" when the question explicitly says "contract(s)",
+  "agreement(s)", or asks about contract value/parties. Otherwise
+  scope="invoice" (default).
 
 Return ONLY JSON. No explanation. No markdown.
 """)
@@ -134,7 +143,16 @@ def select_from_ranking(ranked: list, selection: dict, format_line_fn):
         elif tier == "low":
             subset = [(n, s) for n, s in ranked if s < avg_score]
         else:
-            subset = [(n, s) for n, s in ranked if abs(s - avg_score) <= 15]
+            # Use a relative tolerance (15% of the average) instead of an
+            # absolute number — works correctly whether scores are 0-100
+            # importance points or six-figure currency totals.
+            tolerance = abs(avg_score) * 0.15
+            subset = [(n, s) for n, s in ranked if abs(s - avg_score) <= tolerance]
+            if not subset and ranked:
+                # Guarantee at least one result — fall back to the single
+                # closest item rather than returning nothing.
+                closest = min(ranked, key=lambda x: abs(x[1] - avg_score))
+                subset = [closest]
         for i, (name, score) in enumerate(subset[:10], 1):
             lines.append(format_line_fn(name, score, idx=i))
         return {"lines": lines, "selected": subset, "average": avg_score}

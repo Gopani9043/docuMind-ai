@@ -15,6 +15,7 @@ from chatbot.response_synthesizer import _build_list_response
 from chatbot.special_intent_classifier import classify_special_intent
 from chatbot.ranking_selector import parse_ranking_selection, select_from_ranking
 from services.vendor_matcher import normalize
+from chatbot.threshold_extractor import extract_amount_threshold, apply_amount_threshold
 
 from chatbot.memory_manager import (
     save_turn, get_recent_context,
@@ -84,6 +85,34 @@ RULES:
 Return ONLY JSON. No explanation.
 """)
 
+SYNONYM_MAP = {
+    r'\brechnungen\b': 'invoices',
+    r'\brechnung\b': 'invoice',
+    r'\bfakturas\b': 'invoices',
+    r'\bfaktura\b': 'invoice',
+    r'\bverträge\b': 'contracts',
+    r'\bvertrag\b': 'contract',
+    r'\bkassenbons\b': 'receipts',
+    r'\bkassenbon\b': 'receipt',
+    r'\blieferanten\b': 'vendors',
+    r'\blieferant\b': 'vendor',
+}
+
+def normalize_synonyms(question: str) -> str:
+    """
+    Translate known non-English/synonym terms to canonical English terms
+    ONCE, before any keyword list or LLM call sees the question. This
+    means every existing keyword list (which only knows English terms)
+    works correctly without needing every synonym added to every list
+    separately across the codebase.
+    """
+    normalized = question
+    for pattern, replacement in SYNONYM_MAP.items():
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    if normalized != question:
+        logger.info(f"Synonym normalization: '{question}' -> '{normalized}'")
+    return normalized
+
 def parse_mixed_date(date_str):
     """
     Parse a date string in any of the mixed formats found across extracted
@@ -133,6 +162,57 @@ async def get_all_vendor_names(db: AsyncSession) -> list:
     rows = await execute_query(sql, db)
     return [r["vendor"] for r in rows if r.get("vendor")]
 
+async def get_contract_party_totals(db: AsyncSession) -> dict:
+    """
+    Compute total contract value per company, where each party listed in
+    a contract's 'parties' array gets full credit for that contract's
+    value. Mirrors invoice vendor_totals logic but for the contract
+    document type, which has no single vendor_name field.
+    """
+    party_sql = """
+        SELECT
+            party as company,
+            r.extracted_data->>'value' as raw_value,
+            r.extracted_data->>'currency' as currency
+        FROM documents d
+        JOIN extraction_results r ON r.doc_id = d.id
+        CROSS JOIN LATERAL json_array_elements_text(
+            CASE
+                WHEN r.extracted_data->'parties' IS NOT NULL
+                AND json_typeof(r.extracted_data->'parties') = 'array'
+                THEN r.extracted_data->'parties'
+                ELSE '[]'::json
+            END
+        ) as party
+        WHERE r.document_type = 'contract' AND d.status = 'done'
+    """
+    rows = await execute_query(party_sql, db)
+    rates = await get_exchange_rates()
+
+    party_totals = {}
+    party_counts = {}
+    for row in rows:
+        company = row.get("company")
+        raw_value = row.get("raw_value")
+        currency = row.get("currency")
+        if not company:
+            continue
+        party_counts[company] = party_counts.get(company, 0) + 1
+        if raw_value is None or not currency:
+            continue
+        cleaned = re.sub(r'[^0-9.]', '', str(raw_value))
+        if not cleaned:
+            continue
+        try:
+            amt = float(cleaned)
+        except ValueError:
+            continue
+        base_amt = convert_to_base(amt, currency, rates)
+        if base_amt is None:
+            continue
+        party_totals[company] = party_totals.get(company, 0) + base_amt
+
+    return {"totals": party_totals, "counts": party_counts}
 
 # ── Helper: Resolve partial/abbreviated vendor mentions to canonical names ─────
 
@@ -646,6 +726,7 @@ async def process_message(
     session_id: str,
     db: AsyncSession
 ) -> dict:
+    question = normalize_synonyms(question)
     logger.info(f"[{session_id}] Processing: {question}")
 
     # ── Step 1: Load memory ───────────────────────
@@ -888,7 +969,7 @@ async def process_message(
 
     # ── Step 3f: Handle overdue/expiring with safe Python SQL ────
     overdue_keywords = ["overdue", "past due", "late payment", "unpaid", "outstanding"]
-    expiring_keywords = ["expiring", "expiring soon", "ending soon", "renewal due"]
+    expiring_keywords = ["expiring", "expiring soon", "ending soon", "renewal due", "expires", "expire"]
 
     _q_overdue = question.lower()
     has_overdue_extra = any([
@@ -1180,8 +1261,8 @@ async def process_message(
 
     # ── Step 3v: Semantic special-intent routing — understands MEANING,
     # not exact phrasing. Computed once, used by Steps 3i, 3x, 3y, 3z, 3w below. ──
-    special_intent = classify_special_intent(question, history)
-    logger.info(f"[{session_id}] Special intent: {special_intent}")
+    special_intent, concern_tone = classify_special_intent(question, history)
+    logger.info(f"[{session_id}] Special intent: {special_intent} (concern={concern_tone})")
 
     # ── Step 3i: Cross-currency "biggest bills" — real exchange rate conversion ──
     biggest_keywords = [
@@ -1223,7 +1304,58 @@ async def process_message(
                         continue
                     converted.append({**row, "base_amount": round(base_amt, 2)})
 
+                # ── Apply any threshold mentioned in the question — this
+                # makes the answer correct regardless of how the special
+                # intent classifier categorized it ──
+                threshold = extract_amount_threshold(question)
+                converted = apply_amount_threshold(converted, threshold)
                 converted.sort(key=lambda r: r["base_amount"], reverse=True)
+
+                if threshold.get("has_threshold"):
+                    # ── A threshold filter means "show me everything that
+                    # matches" — not "show me your top N." Never cap this
+                    # to 10; show the complete matching set. ──
+                    if not converted:
+                        answer = "No invoices match that amount threshold."
+                        save_turn(session_id, "assistant", answer, {"intent": "biggest_bills_converted"})
+                        return {
+                            "answer": answer, "intent": "biggest_bills_converted", "session_id": session_id,
+                            "rewritten": None, "sql": None, "results": [], "count": 0
+                        }
+
+                    lines = ["💰 Matching invoices:\n"]
+                    for i, row in enumerate(converted, 1):
+                        try:
+                            amount_val = float(row['amount'])
+                        except (ValueError, TypeError):
+                            amount_val = 0.0
+                        vendor_display = row.get('vendor') or 'Unknown vendor'
+                        line = f"{i}. {row['filename']} | {vendor_display} | {amount_val:,.2f} {row['currency']}"
+                        # Only show the converted figure when it's a genuine
+                        # cross-currency conversion — never repeat the same
+                        # number back when the currency is already EUR.
+                        if row['currency'] != BASE_CURRENCY:
+                            line += f" (≈ {row['base_amount']:,.2f} {BASE_CURRENCY})"
+                        lines.append(line)
+                    lines.append(f"\n{len(converted)} result(s) shown.")
+                    answer = "\n".join(lines)
+
+                    set_last_results(session_id, converted)
+                    update_active_state(session_id, {
+                        "intent": "biggest_bills_converted",
+                        "active_dataset": "invoice",
+                        "result_count": len(converted),
+                        "last_sql": raw_sql
+                    })
+                    save_turn(session_id, "assistant", answer, {
+                        "intent": "biggest_bills_converted",
+                        "count": len(converted),
+                        "results_sample": converted[:3]
+                    })
+                    return {
+                        "answer": answer, "intent": "biggest_bills_converted", "session_id": session_id,
+                        "rewritten": None, "sql": raw_sql, "results": converted, "count": len(converted)
+                    }
 
                 ranked_bills = [(i, row["base_amount"]) for i, row in enumerate(converted)]
                 bills_by_index = {i: row for i, row in enumerate(converted)}
@@ -1238,8 +1370,9 @@ async def process_message(
                         amount_val = float(row['amount'])
                     except (ValueError, TypeError):
                         amount_val = 0.0
+                    vendor_display = row.get('vendor') or 'Unknown vendor'
                     line = (
-                        f"{prefix}{row['filename']} | {row.get('vendor', 'Unknown')} | "
+                        f"{prefix}{row['filename']} | {vendor_display} | "
                         f"{amount_val:,.2f} {row['currency']} "
                         f"(≈ {row['base_amount']:,.2f} {BASE_CURRENCY})"
                     )
@@ -1299,6 +1432,99 @@ async def process_message(
                 }
             except Exception as e:
                 logger.error(f"[{session_id}] Biggest bills conversion failed: {e}", exc_info=True)
+
+    # ── Step 3i-b: Biggest contracts by value ─────────────────────────────────
+    if special_intent == "biggest_contracts":
+        logger.info(f"[{session_id}] Biggest contracts triggered")
+        raw_sql = """
+            SELECT DISTINCT ON (d.filename)
+                d.filename,
+                r.extracted_data->>'parties' as parties,
+                NULLIF(REGEXP_REPLACE(r.extracted_data->>'value','[^0-9.]','','g'),'')::numeric as amount,
+                r.extracted_data->>'currency' as currency
+            FROM documents d
+            JOIN extraction_results r ON r.doc_id = d.id
+            WHERE r.document_type = 'contract'
+            AND d.status = 'done'
+            AND r.extracted_data->>'value' IS NOT NULL
+            ORDER BY d.filename, d.created_at DESC
+        """
+        is_valid, _ = validate_sql(raw_sql)
+        if is_valid:
+            try:
+                raw_results = await execute_query(raw_sql, db)
+                rates = await get_exchange_rates()
+
+                converted = []
+                for row in raw_results:
+                    amt = row.get("amount")
+                    cur = row.get("currency")
+                    if amt is None or not cur:
+                        continue
+                    base_amt = convert_to_base(float(amt), cur, rates)
+                    if base_amt is None:
+                        continue
+                    converted.append({**row, "base_amount": round(base_amt, 2)})
+
+                converted.sort(key=lambda r: r["base_amount"], reverse=True)
+                top_results = converted[:10]
+
+                lines = [f"📋 Biggest Contracts (converted to {BASE_CURRENCY} for fair comparison)\n"]
+                for i, row in enumerate(top_results, 1):
+                    try:
+                        amount_val = float(row['amount'])
+                    except (ValueError, TypeError):
+                        amount_val = 0.0
+
+                    # Clean parties JSON
+                    raw_parties = row.get("parties", "")
+                    try:
+                        import json as _json
+                        parsed = _json.loads(raw_parties)
+                        if isinstance(parsed, list):
+                            names = [
+                                p.get("name", "") if isinstance(p, dict) else str(p)
+                                for p in parsed
+                                if (p.get("name", "") if isinstance(p, dict) else str(p))
+                                not in ("[MISSING_COMPANY_NAME]", "PARTY B (CLIENT)", "")
+                            ]
+                            parties_str = " / ".join(names)
+                        else:
+                            parties_str = str(raw_parties)
+                    except Exception:
+                        parties_str = str(raw_parties)
+
+                    lines.append(
+                        f"{i}. {row['filename']} | {parties_str} | "
+                        f"{amount_val:,.2f} {row['currency']} "
+                        f"(≈ {row['base_amount']:,.2f} {BASE_CURRENCY})"
+                    )
+                lines.append(f"\n{len(top_results)} result(s). Ranked by {BASE_CURRENCY}-equivalent value.")
+                answer = "\n".join(lines)
+
+                set_last_results(session_id, top_results)
+                update_active_state(session_id, {
+                    "intent": "biggest_contracts",
+                    "active_dataset": "contract",
+                    "result_count": len(top_results),
+                    "last_sql": raw_sql
+                })
+                save_turn(session_id, "assistant", answer, {
+                    "intent": "biggest_contracts",
+                    "count": len(top_results),
+                    "results_sample": top_results[:3]
+                })
+                return {
+                    "answer": answer,
+                    "intent": "biggest_contracts",
+                    "session_id": session_id,
+                    "rewritten": None,
+                    "sql": raw_sql,
+                    "results": top_results,
+                    "count": len(top_results)
+                }
+            except Exception as e:
+                logger.error(f"[{session_id}] Biggest contracts failed: {e}", exc_info=True)
 
     # ── Step 3j: Top-N + related docs — LLM extracts params, Python executes ─
     q_lower = question.lower()  # define locally for Step 3j
@@ -1896,23 +2122,33 @@ Return ONLY valid JSON. No explanation. No markdown.
         except Exception as e:
             logger.error(f"[{session_id}] Vendor risk assessment failed: {e}", exc_info=True)
 
-    # ── Step 3w: "Is spending increasing or decreasing" — true trend with
-    # currency conversion AND full transparency on excluded rows ──
+    # ── Step 3w: Spending trend — invoice, contract, or receipt ──────────────
     if special_intent == "spending_trend":
         logger.info(f"[{session_id}] Spending direction trend triggered")
         try:
-            raw_sql = """
+            # Detect which document type the user is asking about
+            trend_doc_type = "invoice"
+            trend_date_field = "issue_date"
+            trend_amount_field = "total_amount"
+            if any(k in question.lower() for k in ["contract", "agreement", "vertrag"]):
+                trend_doc_type = "contract"
+                trend_date_field = "start_date"
+                trend_amount_field = "value"
+            elif any(k in question.lower() for k in ["receipt", "kassenbon"]):
+                trend_doc_type = "receipt"
+
+            raw_sql = f"""
                 SELECT
-                    r.extracted_data->>'issue_date' as issue_date,
-                    r.extracted_data->>'total_amount' as raw_amount,
+                    r.extracted_data->>'{trend_date_field}' as issue_date,
+                    r.extracted_data->>'{trend_amount_field}' as raw_amount,
                     r.extracted_data->>'currency' as currency
                 FROM documents d
                 JOIN extraction_results r ON r.doc_id = d.id
-                WHERE r.document_type = 'invoice' AND d.status = 'done'
+                WHERE r.document_type = '{trend_doc_type}' AND d.status = 'done'
             """
             raw_rows = await execute_query(raw_sql, db)
             rates = await get_exchange_rates()
-            rates_unavailable = len(rates) <= 1  # only has BASE_CURRENCY itself, or truly empty
+            rates_unavailable = len(rates) <= 1
 
             monthly_totals = {}
             monthly_counts = {}
@@ -1946,8 +2182,15 @@ Return ONLY valid JSON. No explanation. No markdown.
                 monthly_totals[key] = monthly_totals.get(key, 0) + base_amt
                 monthly_counts[key] = monthly_counts.get(key, 0) + 1
 
-            # ── One LLM call decides selection AND metric semantically —
-            # no keyword lists anywhere in this handler ──
+            # ── Detect concern framing once — reused below regardless of path ──
+            worry_words = [
+                "worried", "worry", "concerned", "concern", "should i",
+                "is it bad", "is this ok", "too much", "too high",
+                "alarming", "dangerous", "risky", "problem", "issue"
+            ]
+            concern_tone = any(w in question.lower() for w in worry_words)
+
+            # ── LLM decides if user wants a specific slice or the full trend ──
             selection = parse_ranking_selection(question)
             wants_specific_month = selection.get("selection_type") in (
                 "single_rank", "top_n", "bottom_n", "tier", "average", "compare"
@@ -1967,115 +2210,405 @@ Return ONLY valid JSON. No explanation. No markdown.
                     total = next((monthly_totals[k] for k in monthly_totals
                                   if _dt.strptime(k, "%Y-%m").strftime("%b %Y") == label), 0)
                     prefix = f"{idx}. " if idx else "📈 "
-                    return f"{prefix}{label}: {count} invoices | {total:,.2f} {BASE_CURRENCY}"
+                    return (
+                        f"{prefix}{label}: {count} {trend_doc_type}s | "
+                        f"{total:,.2f} {BASE_CURRENCY}"
+                    )
 
                 result = select_from_ranking(ranked_months, selection, format_month_line)
-                header = f"📊 Monthly {'Invoice Count' if wants_count_metric else 'Spending'} Ranking"
+                header = f"📊 Monthly {trend_doc_type.title()} {'Count' if wants_count_metric else 'Spending'} Ranking"
                 if not wants_count_metric:
                     header += f" (converted to {BASE_CURRENCY})"
                 lines = [header + ":\n"] + result["lines"]
 
                 if rates_unavailable:
-                    lines.append(f"\n⚠️ Exchange rate service unavailable — results may only include {BASE_CURRENCY}-denominated invoices and could be incomplete.")
+                    lines.append(
+                        f"\n⚠️ Exchange rate service unavailable — results may only include "
+                        f"{BASE_CURRENCY}-denominated {trend_doc_type}s."
+                    )
+
+            else:
+                # ── Full trend view ───────────────────────────────────────────
+                sorted_months = sorted(monthly_totals.keys())
+                lines = [f"📈 Monthly {trend_doc_type.title()} Trend (converted to {BASE_CURRENCY})\n"]
+
+                for key in sorted_months:
+                    label = _dt.strptime(key, "%Y-%m").strftime("%b %Y")
+                    lines.append(
+                        f"{label}: {monthly_counts[key]} {trend_doc_type}s | "
+                        f"{monthly_totals[key]:,.2f} {BASE_CURRENCY}"
+                    )
+
+                if len(sorted_months) >= 2:
+                    half = len(sorted_months) // 2
+                    early_avg = sum(monthly_totals[m] for m in sorted_months[:half]) / max(half, 1)
+                    recent_avg = sum(monthly_totals[m] for m in sorted_months[half:]) / max(len(sorted_months) - half, 1)
+
+                    if recent_avg > early_avg * 1.05:
+                        pct_change = ((recent_avg - early_avg) / early_avg * 100)
+                        insight = (
+                            f"📊 Spending is increasing — recent average ({recent_avg:,.2f} {BASE_CURRENCY}) "
+                            f"is {pct_change:.0f}% higher than earlier average ({early_avg:,.2f} {BASE_CURRENCY})."
+                        )
+                    elif recent_avg < early_avg * 0.95:
+                        pct_change = ((early_avg - recent_avg) / early_avg * 100)
+                        insight = (
+                            f"📊 Spending is decreasing — recent average ({recent_avg:,.2f} {BASE_CURRENCY}) "
+                            f"is {pct_change:.0f}% lower than earlier average ({early_avg:,.2f} {BASE_CURRENCY})."
+                        )
+                    else:
+                        insight = "📊 Spending has remained relatively stable."
+                    lines.append(f"\n{insight}")
+
+                lines.append(f"\n{len(sorted_months)} months analyzed.")
+
+                if rates_unavailable:
+                    lines.append(
+                        f"\n⚠️ Exchange rate service unavailable — results may only include "
+                        f"{BASE_CURRENCY}-denominated {trend_doc_type}s."
+                    )
+
+            # ── Exclusion report (shared by both paths) ───────────────────────
+            total_excluded = (
+                excluded_no_date + excluded_no_amount +
+                excluded_no_currency + excluded_unknown_currency
+            )
+            if total_excluded > 0:
+                parts = []
+                if excluded_no_date:
+                    parts.append(f"{excluded_no_date} with unparseable date")
+                if excluded_no_amount:
+                    parts.append(f"{excluded_no_amount} with missing/invalid amount")
+                if excluded_no_currency:
+                    parts.append(f"{excluded_no_currency} with missing currency")
+                if excluded_unknown_currency:
+                    parts.append(f"{excluded_unknown_currency} with unsupported currency")
+                lines.append(
+                    f"⚠️ {total_excluded} of {total_processed} {trend_doc_type}(s) excluded "
+                    f"({', '.join(parts)})."
+                )
+
+            trend_text = "\n".join(lines)
+
+            # ── If user expressed concern, ask the LLM to interpret the REAL
+            # data — no hardcoded canned paragraphs. The answer changes based
+            # on what the numbers actually show, not a fixed template. ──
+            if concern_tone:
+                concern_prompt = ChatPromptTemplate.from_template("""
+You are a financial analyst assistant for a document analytics system.
+
+The user asked: {question}
+
+Here is the actual spending trend data from their database:
+{trend_data}
+
+Based on this real data, give a direct, honest 2-3 sentence answer to their question.
+- If spending is clearly increasing significantly, say so and explain what that means practically.
+- If spending is stable or decreasing, reassure them with the actual numbers.
+- Reference the actual numbers from the trend data in your answer.
+- Do not make up data. Only use what is shown above.
+- Do not repeat the full trend table — just answer the concern directly.
+- End with one actionable suggestion (e.g. check vendor risk, review duplicates).
+
+Answer:
+""")
+                try:
+                    concern_answer = invoke_with_fallback(
+                        lambda llm: concern_prompt | llm,
+                        {"question": question, "trend_data": trend_text}
+                    )
+                    answer = trend_text + f"\n\n💡 {concern_answer.strip()}"
+                except Exception as e:
+                    logger.error(f"[{session_id}] Concern interpretation failed: {e}")
+                    answer = trend_text
+            else:
+                answer = trend_text
+
+            save_turn(session_id, "assistant", answer, {"intent": "spending_trend_converted"})
+            return {
+                "answer": answer,
+                "intent": "spending_trend_converted",
+                "session_id": session_id,
+                "rewritten": None,
+                "sql": None,
+                "results": [],
+                "count": 0
+            }
+        except Exception as e:
+            logger.error(f"[{session_id}] Spending direction trend failed: {e}", exc_info=True)
+
+    # ── Step 3t: Pure vendor spend ranking — currency-converted, no
+    # composite scoring (unlike most_important_vendor) ──
+    if special_intent == "vendor_spend_ranking":
+        logger.info(f"[{session_id}] Vendor spend ranking triggered")
+        try:
+            # ── Step 1: LLM extracts BOTH ranking selection AND filter constraints ──
+            # Universal — works for any phrasing of filters or ranking
+            filter_prompt = ChatPromptTemplate.from_template("""
+You are a parameter extractor for a vendor spend ranking query.
+
+Extract ALL constraints from this question and return ONLY valid JSON.
+
+QUESTION: {question}
+
+Return JSON:
+{{
+  "scope": "invoice or contract",
+  "min_invoices": <minimum invoice/contract count required, or null>,
+  "max_invoices": <maximum invoice/contract count required, or null>,
+  "min_spend": <minimum total spend amount required, or null>,
+  "max_spend": <maximum total spend amount required, or null>,
+  "currency": "EUR|USD|GBP|null",
+  "selection_type": "top_n|bottom_n|single_rank|full_list|compare",
+  "n": <number for top_n/bottom_n, or null>,
+  "direction": "top|bottom",
+  "compare_items": [<vendor name fragments if comparing specific vendors>]
+}}
+
+Examples:
+- "top 5 vendors by spend" → selection_type=top_n, n=5, direction=top
+- "vendors with at least 5 invoices" → min_invoices=5
+- "top 10 vendors with more than 3 invoices" → selection_type=top_n, n=10, min_invoices=3
+- "bottom 3 vendors by EUR spend" → selection_type=bottom_n, n=3, currency=EUR
+- "vendors with less than 5 invoices" → max_invoices=4
+- "compare BrightPath vs FinEdge" → selection_type=compare, compare_items=["BrightPath","FinEdge"]
+- "show all vendor spend" → selection_type=full_list
+
+Return ONLY valid JSON. No explanation. No markdown.
+""")
+
+            params_str = invoke_with_fallback(
+                lambda llm: filter_prompt | llm,
+                {"question": question}
+            )
+            # Clean JSON
+            if "```" in params_str:
+                params_str = params_str.split("```")[1]
+                if params_str.startswith("json"):
+                    params_str = params_str[4:]
+            try:
+                params = json.loads(params_str.strip())
+            except Exception:
+                params = {"scope": "invoice", "selection_type": "full_list", "direction": "top"}
+
+            scope = params.get("scope", "invoice")
+            min_invoices = params.get("min_invoices")
+            max_invoices = params.get("max_invoices")
+            min_spend = params.get("min_spend")
+            max_spend = params.get("max_spend")
+            filter_currency = params.get("currency")
+            direction = params.get("direction", "top")
+            n = params.get("n")
+            selection_type = params.get("selection_type", "full_list")
+            compare_items = params.get("compare_items", [])
+
+            # Build selection dict compatible with select_from_ranking
+            selection = {
+                "selection_type": selection_type,
+                "n": n,
+                "direction": direction,
+                "rank_position": 1 if selection_type == "single_rank" else None,
+                "compare_items": compare_items
+            }
+
+            # ── Step 2: Fetch raw data ────────────────────────────────────────
+            if scope == "contract":
+                party_data = await get_contract_party_totals(db)
+                vendor_totals = party_data["totals"]
+                vendor_counts = party_data["counts"]
+                currency_label = BASE_CURRENCY
+                doc_label = "contract"
+            else:
+                raw_sql = """
+                    SELECT
+                        r.extracted_data->>'vendor_name' as vendor,
+                        NULLIF(REGEXP_REPLACE(r.extracted_data->>'total_amount','[^0-9.]','','g'),'')::numeric as amount,
+                        r.extracted_data->>'currency' as currency
+                    FROM documents d
+                    JOIN extraction_results r ON r.doc_id = d.id
+                    WHERE r.document_type = 'invoice'
+                    AND d.status = 'done'
+                    AND r.extracted_data->>'vendor_name' IS NOT NULL
+                    AND r.extracted_data->>'total_amount' IS NOT NULL
+                """
+                raw_rows = await execute_query(raw_sql, db)
+                rates = await get_exchange_rates()
+
+                vendor_totals = {}
+                vendor_counts = {}
+                for row in raw_rows:
+                    vendor = row.get("vendor")
+                    amt = row.get("amount")
+                    cur = row.get("currency")
+                    if not vendor or amt is None:
+                        continue
+                    # Apply currency filter if specified
+                    if filter_currency and cur != filter_currency:
+                        continue
+                    base_amt = convert_to_base(float(amt), cur, rates) if not filter_currency else float(amt)
+                    if base_amt is None:
+                        continue
+                    vendor_totals[vendor] = vendor_totals.get(vendor, 0) + base_amt
+                    vendor_counts[vendor] = vendor_counts.get(vendor, 0) + 1
+
+                currency_label = filter_currency if filter_currency else BASE_CURRENCY
+                doc_label = "invoice"
+
+            # ── Step 3: Apply filters in Python ──────────────────────────────
+            # Deterministic — no LLM needed for applying constraints
+            filtered_totals = {}
+            for vendor, total in vendor_totals.items():
+                count = vendor_counts.get(vendor, 0)
+                if min_invoices is not None and count < min_invoices:
+                    continue
+                if max_invoices is not None and count > max_invoices:
+                    continue
+                if min_spend is not None and total < min_spend:
+                    continue
+                if max_spend is not None and total > max_spend:
+                    continue
+                filtered_totals[vendor] = total
+
+            if not filtered_totals:
+                filter_desc = []
+                if min_invoices is not None:
+                    filter_desc.append(f"at least {min_invoices} {doc_label}s")
+                if max_invoices is not None:
+                    filter_desc.append(f"at most {max_invoices} {doc_label}s")
+                if min_spend is not None:
+                    filter_desc.append(f"spend above {min_spend:,.0f} {currency_label}")
+                if max_spend is not None:
+                    filter_desc.append(f"spend below {max_spend:,.0f} {currency_label}")
+                filter_str = " and ".join(filter_desc) if filter_desc else "those criteria"
+                answer = f"No vendors found with {filter_str}."
+            else:
+                # ── Step 4: Rank and format ───────────────────────────────────
+                order_reverse = direction != "bottom"
+                ranked = sorted(filtered_totals.items(), key=lambda x: x[1], reverse=order_reverse)
+
+                def format_vendor_spend_line(vendor, total, idx=None):
+                    prefix = f"{idx}. " if idx else "🏢 "
+                    count = vendor_counts.get(vendor, 0)
+                    return f"{prefix}{vendor}: {total:,.2f} {currency_label} ({count} {doc_label}s)"
+
+                result = select_from_ranking(ranked, selection, format_vendor_spend_line)
+
+                # Build filter description for header
+                filter_parts = []
+                if min_invoices is not None:
+                    filter_parts.append(f"≥{min_invoices} {doc_label}s")
+                if max_invoices is not None:
+                    filter_parts.append(f"≤{max_invoices} {doc_label}s")
+                if filter_currency:
+                    filter_parts.append(f"{filter_currency} only")
+                filter_suffix = f" [{', '.join(filter_parts)}]" if filter_parts else ""
+
+                header = f"💰 Vendor Spend Ranking (converted to {currency_label}){filter_suffix}:\n"
+                lines = [header] + result["lines"]
+
+                if selection_type == "compare" and len(result.get("selected", [])) >= 2:
+                    vals = sorted(result["selected"], key=lambda x: x[1], reverse=True)
+                    lines.append(f"\n{vals[0][0]} leads by {(vals[0][1] - vals[1][1]):,.2f} {currency_label}.")
 
                 answer = "\n".join(lines)
-                save_turn(session_id, "assistant", answer, {"intent": "spending_trend_converted"})
-                return {
-                    "answer": answer, "intent": "spending_trend_converted", "session_id": session_id,
-                    "rewritten": None, "sql": None, "results": [], "count": 0
-                }
 
-            # ── Otherwise show the full trend ──
-            sorted_months = sorted(monthly_totals.keys())
-            lines = [f"📈 Monthly Spending Trend (converted to {BASE_CURRENCY})\n"]
-            for key in sorted_months:
-                label = _dt.strptime(key, "%Y-%m").strftime("%b %Y")
-                lines.append(f"{label}: {monthly_counts[key]} invoices | {monthly_totals[key]:,.2f} {BASE_CURRENCY}")
-
-            if len(sorted_months) >= 2:
-                half = len(sorted_months) // 2
-                early_avg = sum(monthly_totals[m] for m in sorted_months[:half]) / max(half, 1)
-                recent_avg = sum(monthly_totals[m] for m in sorted_months[half:]) / max(len(sorted_months) - half, 1)
-                if recent_avg > early_avg * 1.05:
-                    insight = f"📊 Spending is increasing — recent average ({recent_avg:,.2f} {BASE_CURRENCY}) is higher than earlier average ({early_avg:,.2f} {BASE_CURRENCY})."
-                elif recent_avg < early_avg * 0.95:
-                    insight = f"📊 Spending is decreasing — recent average ({recent_avg:,.2f} {BASE_CURRENCY}) is lower than earlier average ({early_avg:,.2f} {BASE_CURRENCY})."
-                else:
-                    insight = "📊 Spending has remained relatively stable."
-                lines.append(f"\n{insight}")
-
-            lines.append(f"\n{len(sorted_months)} months analyzed.")
-
-            total_excluded = excluded_no_date + excluded_no_amount + excluded_no_currency + excluded_unknown_currency
-            if total_excluded > 0:
-                parts = []
-                if excluded_no_date:
-                    parts.append(f"{excluded_no_date} with unparseable issue date")
-                if excluded_no_amount:
-                    parts.append(f"{excluded_no_amount} with missing/invalid amount")
-                if excluded_no_currency:
-                    parts.append(f"{excluded_no_currency} with missing currency")
-                if excluded_unknown_currency:
-                    parts.append(f"{excluded_unknown_currency} with unsupported currency")
-                lines.append(
-                    f"⚠️ {total_excluded} of {total_processed} invoice(s) excluded from this trend "
-                    f"({', '.join(parts)})."
-                )
-
-            answer = "\n".join(lines)
-            save_turn(session_id, "assistant", answer, {"intent": "spending_trend_converted"})
+            save_turn(session_id, "assistant", answer, {"intent": "vendor_spend_ranking"})
             return {
-                "answer": answer, "intent": "spending_trend_converted", "session_id": session_id,
+                "answer": answer, "intent": "vendor_spend_ranking",
+                "session_id": session_id, "rewritten": None,
+                "sql": None, "results": [], "count": 0
+            }
+        except Exception as e:
+            logger.error(f"[{session_id}] Vendor spend ranking failed: {e}", exc_info=True)
+            # If a specific currency is named, respect it as a real filter
+            currency_match = re.search(
+                r'\b(EUR|USD|GBP|JPY|CHF|INR|CAD|AUD)\b', question, re.IGNORECASE
+            )
+            requested_currency = currency_match.group(1).upper() if currency_match else None
+
+            raw_sql = """
+                SELECT
+                    r.extracted_data->>'vendor_name' as vendor,
+                    NULLIF(REGEXP_REPLACE(r.extracted_data->>'total_amount','[^0-9.]','','g'),'')::numeric as amount,
+                    r.extracted_data->>'currency' as currency
+                FROM documents d
+                JOIN extraction_results r ON r.doc_id = d.id
+                WHERE r.document_type = 'invoice'
+                AND d.status = 'done'
+                AND r.extracted_data->>'vendor_name' IS NOT NULL
+                AND r.extracted_data->>'total_amount' IS NOT NULL
+            """
+            raw_rows = await execute_query(raw_sql, db)
+
+            vendor_totals = {}
+            vendor_counts = {}
+
+            if requested_currency:
+                # Explicit currency named — filter to that currency only,
+                # no conversion needed since everything's already in it
+                for row in raw_rows:
+                    if row.get("currency") != requested_currency:
+                        continue
+                    try:
+                        amt = float(row["amount"])
+                    except (TypeError, ValueError):
+                        continue
+                    v = row["vendor"]
+                    vendor_totals[v] = vendor_totals.get(v, 0) + amt
+                    vendor_counts[v] = vendor_counts.get(v, 0) + 1
+                currency_label = requested_currency
+            else:
+                # No currency named — convert everything to EUR for a fair ranking
+                rates = await get_exchange_rates()
+                for row in raw_rows:
+                    amt, cur, v = row.get("amount"), row.get("currency"), row.get("vendor")
+                    if amt is None or not cur:
+                        continue
+                    base_amt = convert_to_base(float(amt), cur, rates)
+                    if base_amt is None:
+                        continue
+                    vendor_totals[v] = vendor_totals.get(v, 0) + base_amt
+                    vendor_counts[v] = vendor_counts.get(v, 0) + 1
+                currency_label = BASE_CURRENCY
+
+            if not vendor_totals:
+                answer = "No vendor spending data found."
+            else:
+                ranked = sorted(vendor_totals.items(), key=lambda x: x[1], reverse=True)
+                selection = parse_ranking_selection(question)
+
+                def format_vendor_spend_line(vendor, total, idx=None):
+                    prefix = f"{idx}. " if idx else "🏢 "
+                    count = vendor_counts.get(vendor, 0)
+                    return f"{prefix}{vendor}: {total:,.2f} {currency_label} ({count} invoices)"
+
+                result = select_from_ranking(ranked, selection, format_vendor_spend_line)
+
+                if selection.get("selection_type") == "compare" and len(result.get("selected", [])) >= 2:
+                    header = "⚖️ Vendor Spending Comparison"
+                else:
+                    header = "💰 Vendor Spend Ranking"
+                if requested_currency:
+                    header += f" (in {requested_currency} only)"
+                else:
+                    header += f" (converted to {BASE_CURRENCY})"
+                lines = [header + ":\n"] + result["lines"]
+
+                if selection.get("selection_type") == "compare" and len(result.get("selected", [])) >= 2:
+                    top_name, top_val = max(result["selected"], key=lambda x: x[1])
+                    second_name, second_val = sorted(result["selected"], key=lambda x: x[1], reverse=True)[1]
+                    diff = top_val - second_val
+                    lines.append(f"\n{top_name} leads by {diff:,.2f} {currency_label}.")
+
+                answer = "\n".join(lines)
+
+            save_turn(session_id, "assistant", answer, {"intent": "vendor_spend_ranking"})
+            return {
+                "answer": answer, "intent": "vendor_spend_ranking", "session_id": session_id,
                 "rewritten": None, "sql": None, "results": [], "count": 0
             }
         except Exception as e:
-            logger.error(f"[{session_id}] Spending direction trend failed: {e}", exc_info=True)
-
-            # ── Otherwise show the full trend (existing code continues below) ──
-            sorted_months = sorted(monthly_totals.keys())
-            lines = [f"📈 Monthly Spending Trend (converted to {BASE_CURRENCY})\n"]
-            for key in sorted_months:
-                label = _dt.strptime(key, "%Y-%m").strftime("%b %Y")
-                lines.append(f"{label}: {monthly_counts[key]} invoices | {monthly_totals[key]:,.2f} {BASE_CURRENCY}")
-
-            if len(sorted_months) >= 2:
-                half = len(sorted_months) // 2
-                early_avg = sum(monthly_totals[m] for m in sorted_months[:half]) / max(half, 1)
-                recent_avg = sum(monthly_totals[m] for m in sorted_months[half:]) / max(len(sorted_months) - half, 1)
-                if recent_avg > early_avg * 1.05:
-                    insight = f"📊 Spending is increasing — recent average ({recent_avg:,.2f} {BASE_CURRENCY}) is higher than earlier average ({early_avg:,.2f} {BASE_CURRENCY})."
-                elif recent_avg < early_avg * 0.95:
-                    insight = f"📊 Spending is decreasing — recent average ({recent_avg:,.2f} {BASE_CURRENCY}) is lower than earlier average ({early_avg:,.2f} {BASE_CURRENCY})."
-                else:
-                    insight = "📊 Spending has remained relatively stable."
-                lines.append(f"\n{insight}")
-
-            lines.append(f"\n{len(sorted_months)} months analyzed.")
-
-            total_excluded = excluded_no_date + excluded_no_amount + excluded_no_currency + excluded_unknown_currency
-            if total_excluded > 0:
-                parts = []
-                if excluded_no_date:
-                    parts.append(f"{excluded_no_date} with unparseable issue date")
-                if excluded_no_amount:
-                    parts.append(f"{excluded_no_amount} with missing/invalid amount")
-                if excluded_no_currency:
-                    parts.append(f"{excluded_no_currency} with missing currency")
-                if excluded_unknown_currency:
-                    parts.append(f"{excluded_unknown_currency} with unsupported currency")
-                lines.append(
-                    f"⚠️ {total_excluded} of {total_processed} invoice(s) excluded from this trend "
-                    f"({', '.join(parts)})."
-                )
-
-            answer = "\n".join(lines)
-            save_turn(session_id, "assistant", answer, {"intent": "spending_trend_converted"})
-            return {
-                "answer": answer, "intent": "spending_trend_converted", "session_id": session_id,
-                "rewritten": None, "sql": None, "results": [], "count": 0
-            }
-        except Exception as e:
-            logger.error(f"[{session_id}] Spending direction trend failed: {e}", exc_info=True)
+            logger.error(f"[{session_id}] Vendor spend ranking failed: {e}", exc_info=True)
 
     # ── Step 3u: "Most important vendor" — composite score
     # (converted spend + frequency + contract presence), fully transparent ──
@@ -2214,7 +2747,43 @@ Return ONLY valid JSON. No explanation. No markdown.
                         )
                 else:
                     result = select_from_ranking(ranked, selection, format_vendor_line)
-                    lines = ["📊 Vendor Importance:\n"] + result["lines"]
+                    raw_lines = ["📊 Vendor Importance:\n"] + result["lines"]
+                    raw_text = "\n".join(raw_lines)
+
+                    # ── LLM interprets the data to answer the actual question ──
+                    # Works for any comparison/analytical phrasing — not hardcoded
+                    interpret_prompt = ChatPromptTemplate.from_template("""
+You are a financial analyst assistant for a document analytics system.
+
+The user asked: {question}
+
+Here is the vendor importance data from the database:
+{vendor_data}
+
+Scoring breakdown:
+- Importance score = 60% total spend + 25% invoice frequency + 15% contract presence
+- Score is out of 100, relative to the top vendor
+
+Answer the user's actual question directly in 2-4 sentences using the real numbers above.
+- If they asked about comparison, compare the specific vendors mentioned
+- If they asked whether frequency is the main driver, check if frequency scores differ significantly from spend scores
+- Reference actual scores and numbers — do not invent data
+- Be direct and conversational, not bullet points
+
+Answer:
+""")
+                    try:
+                        interpretation = invoke_with_fallback(
+                            lambda llm: interpret_prompt | llm,
+                            {
+                                "question": question,
+                                "vendor_data": raw_text
+                            }
+                        )
+                        lines = [raw_text, f"\n💡 {interpretation.strip()}"]
+                    except Exception as e:
+                        logger.error(f"[{session_id}] Vendor importance interpretation failed: {e}")
+                        lines = raw_lines
 
                 if excluded_count > 0:
                     lines.append(f"\n⚠️ {excluded_count} invoice(s) excluded from spend calculation (missing/invalid amount or currency).")
