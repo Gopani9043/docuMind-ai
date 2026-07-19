@@ -22,4 +22,5 @@ backend/vector_stores/
 
 # OS
 .DS_Store
-Thumbs.db
+Thumbs.dbredis_monitor.txt
+tests/test_output.txt
