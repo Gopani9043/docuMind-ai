@@ -1,7 +1,7 @@
 import logging
 import os
 import re 
-print("ORCHESTRATOR FILE:", os.path.abspath(__file__))
+# print("ORCHESTRATOR FILE:", os.path.abspath(__file__))
 import json
 import re as _re
 from datetime import datetime as _dt
@@ -611,20 +611,44 @@ def apply_operation_to_sql(
         field = params.get("field", "amount")
         direction = params.get("direction", "desc")
         limit = params.get("limit", 1)
-        # Remove existing ORDER BY and LIMIT
-        sql = base_sql.upper()
+
+        # Remove existing ORDER BY and LIMIT from base SQL
+        sql_upper = base_sql.upper()
         clean = base_sql
-        if "ORDER BY" in sql:
+        if "ORDER BY" in sql_upper:
             clean = base_sql[:base_sql.upper().rfind("ORDER BY")]
-        if "LIMIT" in sql:
+        if "LIMIT" in sql_upper:
             clean = clean[:clean.upper().rfind("LIMIT")]
-        # Map field to actual SQL expression
-        field_map = {
-            "amount": "NULLIF(REPLACE(r.extracted_data->>'total_amount',',',''),'')::numeric",
-            "created_at": "d.created_at"
-        }
+        clean = clean.strip()
+
+        # Detect if base SQL is subquery-wrapped (SELECT * FROM (...) _sub)
+        # In that case, r/d aliases are not available in outer scope —
+        # must use column aliases from the subquery SELECT list instead.
+        is_subquery_wrapped = bool(re.search(
+            r'^\s*SELECT\s+\*\s+FROM\s*\(', clean, re.IGNORECASE
+        ))
+
+        if is_subquery_wrapped:
+            # Use column aliases available in the outer scope
+            field_map = {
+                "amount": "NULLIF(REPLACE(amount::text,',',''),'')::numeric",
+                "created_at": "created_at",
+                "issue_date": "issue_date",
+                "end_date": "end_date",
+                "filename": "filename",
+            }
+        else:
+            # Flat query — r and d aliases are in scope
+            field_map = {
+                "amount": "NULLIF(REPLACE(r.extracted_data->>'total_amount',',',''),'')::numeric",
+                "created_at": "d.created_at",
+                "issue_date": "r.extracted_data->>'issue_date'",
+                "end_date": "r.extracted_data->>'end_date'",
+                "filename": "d.filename",
+            }
+
         sql_field = field_map.get(field, field)
-        return f"{clean.strip()} ORDER BY {sql_field} {direction.upper()} NULLS LAST LIMIT {limit}"
+        return f"{clean} ORDER BY {sql_field} {direction.upper()} NULLS LAST LIMIT {limit}"
 
     if op == "filter":
         clean = base_sql
@@ -645,26 +669,63 @@ def apply_operation_to_sql(
         currency = params.get("currency")
         amount_val = params.get("value")
 
+        new_conditions = []
+
         if vendor and str(vendor).lower() not in ("null", "none", ""):
             vendor = str(vendor).replace("'", "''")
-            clean += f" AND LOWER(r.extracted_data->>'vendor_name') = LOWER('{vendor}')"
+            new_conditions.append(f"LOWER(r.extracted_data->>'vendor_name') = LOWER('{vendor}')")
 
-        # ── Only add currency if explicitly requested, not from active state ──
         if currency and str(currency).lower() not in ("null", "none", "") and "only" in params.get("original_question", "").lower():
             currency = str(currency).replace("'", "''")
-            clean += f" AND r.extracted_data->>'currency' = '{currency}'"
+            new_conditions.append(f"r.extracted_data->>'currency' = '{currency}'")
 
         if amount_val and str(amount_val).lower() not in ("null", "none", ""):
             try:
                 amount_num = float(str(amount_val).replace(",", ""))
-                clean += f" AND NULLIF(REPLACE(r.extracted_data->>'total_amount',',',''),'')::numeric > {amount_num}"
+                new_conditions.append(
+                    f"NULLIF(REPLACE(r.extracted_data->>'total_amount',',',''),'')::numeric > {amount_num}"
+                )
             except ValueError:
                 pass
+
+        if new_conditions:
+            condition_str = " AND ".join(new_conditions)
+
+            # ── Detect subquery-wrapped shape (from fix_distinct_order_conflict):
+            # SELECT * FROM ( <inner query with its own WHERE/ORDER BY> ) _sub
+            # The new filter must go INSIDE the inner query's WHERE clause,
+            # never appended after the closing subquery parenthesis. ──
+            wrapped_match = re.search(
+                r'^\s*SELECT\s+\*\s+FROM\s*\(\s*(.*?)\s*\)\s*_sub\s*$',
+                clean, re.IGNORECASE | re.DOTALL
+            )
+
+            if wrapped_match:
+                inner_sql = wrapped_match.group(1)
+                inner_upper = inner_sql.upper()
+
+                # Inner query has its own ORDER BY (e.g. "ORDER BY d.filename, d.created_at DESC")
+                # — the new condition must go BEFORE that inner ORDER BY, inside WHERE.
+                if "ORDER BY" in inner_upper:
+                    inner_order_pos = inner_sql.upper().rfind("ORDER BY")
+                    inner_order_clause = inner_sql[inner_order_pos:]
+                    inner_body = inner_sql[:inner_order_pos].rstrip()
+                else:
+                    inner_order_clause = ""
+                    inner_body = inner_sql.rstrip()
+
+                inner_body += f" AND {condition_str}"
+                new_inner_sql = f"{inner_body} {inner_order_clause}".strip()
+                clean = f"SELECT * FROM (\n  {new_inner_sql}\n) _sub"
+            else:
+                # Flat query shape — safe to append directly, as before
+                clean += f" AND {condition_str}"
 
         if order_clause:
             clean += f" {order_clause}"
         clean += " LIMIT 200"
         return clean
+
 
     if op == "remove_limit":
         sql = base_sql.upper()
@@ -728,6 +789,17 @@ async def process_message(
 ) -> dict:
     question = normalize_synonyms(question)
     logger.info(f"[{session_id}] Processing: {question}")
+    # ── Detect explicit scoping to previous results — this is a distinct
+    # signal from superlative detection. "Smallest invoice" (no scoping
+    # words) should query the WHOLE database fresh. "Smallest one in the
+    # above" / "from those" / "from that list" explicitly tells us to
+    # operate only on the cached previous results, not the full dataset. ──
+    scoping_phrases = [
+        "in the above", "from the above", "above results", "those results",
+        "from those", "from that list", "in that list", "of those",
+        "in those", "from this list", "among those", "among these",
+    ]
+    is_explicitly_scoped = any(p in question.lower() for p in scoping_phrases)
 
     # ── Step 1: Load memory ───────────────────────
     history = get_recent_context(session_id)
@@ -946,7 +1018,8 @@ async def process_message(
                     "active_dataset": "invoices",
                     "filters": {},
                     "result_count": len(repeat_results),
-                    "last_sql": repeat_sql
+                    "last_sql": repeat_sql,
+                    "protected_sql": True
                 })
 
                 save_turn(session_id, "assistant", answer, {
@@ -1026,7 +1099,8 @@ async def process_message(
                     "intent": "overdue_invoices",
                     "active_dataset": "invoice",
                     "result_count": len(overdue_results),
-                    "last_sql": overdue_sql
+                    "last_sql": overdue_sql,
+                    "protected_sql": True
                 })
                 save_turn(session_id, "assistant", answer, {
                     "intent": "overdue_invoices",
@@ -1259,9 +1333,50 @@ async def process_message(
                 except Exception:
                     pass
 
-    # ── Step 3v: Semantic special-intent routing — understands MEANING,
-    # not exact phrasing. Computed once, used by Steps 3i, 3x, 3y, 3z, 3w below. ──
-    special_intent, concern_tone = classify_special_intent(question, history)
+    # ── Step 3v: Semantic special-intent routing ──────────────────────────────
+    # Skip classifier entirely for follow-up questions — these should
+    # transform the active dataset, not route to a new analytical handler.
+    _q_sv = question.lower().strip()
+    _q_tokens = [t for t in re.findall(r"[a-z0-9]+", _q_sv)]
+    _has_active_sql = bool(active_state.get("last_sql"))
+
+    _is_followup = False
+    if _has_active_sql:
+        # Short question with active context = almost certainly a follow-up
+        if len(_q_tokens) <= 4:
+            _is_followup = True
+        # Starts with continuation/filter words
+        elif _q_tokens and _q_tokens[0] in {
+            "only", "just", "but", "and", "also", "then",
+            "now", "what", "which", "when", "show", "give"
+        } and len(_q_tokens) <= 6:
+            _is_followup = True
+        # Contains ONLY vague references — no new topic words
+        _new_topic_words = {
+            "invoice", "contract", "receipt", "vendor", "spending",
+            "trend", "risk", "important", "biggest", "largest",
+            "interesting", "missing", "data", "quality"
+        }
+        if not any(w in _q_tokens for w in _new_topic_words) and _has_active_sql:
+            _is_followup = True
+
+        # ── Pronoun override: "their", "his", "her", "its" with active SQL
+        # always means follow-up even if topic words present ──────────────
+        pronoun_followup = any(w in _q_sv for w in [
+            "their ", "his ", "her ", "its ", "them ", "they ",
+            "that vendor", "this vendor", "same vendor",
+            "all their", "show their", "show all their",
+            "the riskiest", "riskiest one",
+        ])
+        if pronoun_followup and _has_active_sql:
+            _is_followup = True
+
+    if _is_followup:
+        special_intent, concern_tone = "none", False
+        logger.info(f"[{session_id}] Follow-up detected — skipping special intent classifier")
+    else:
+        special_intent, concern_tone = classify_special_intent(question, history)
+        logger.info(f"[{session_id}] special_intent={special_intent}, _is_followup={_is_followup}, _focus_vendor={conversation_focus.get('vendor') if conversation_focus else None}")
     logger.info(f"[{session_id}] Special intent: {special_intent} (concern={concern_tone})")
 
     # ── Step 3i: Cross-currency "biggest bills" — real exchange rate conversion ──
@@ -1272,8 +1387,15 @@ async def process_message(
         "most expensive bill", "most expensive bills"
     ]
     if special_intent == "biggest_bills":
-        logger.info(f"[{session_id}] Cross-currency biggest bills triggered")
-        raw_sql = """
+        # Don't trigger if question has no document type noun — it's a follow-up
+        bill_nouns = ["bill", "bills", "invoice", "invoices", "payment", "payments",
+                      "expense", "expenses", "charge", "charges"]
+        if not any(w in question.lower() for w in bill_nouns):
+            special_intent = "none"
+            logger.info(f"[{session_id}] biggest_bills suppressed — no document noun in question")
+        else:
+            logger.info(f"[{session_id}] Cross-currency biggest bills triggered")
+            raw_sql = """
             SELECT DISTINCT ON (d.filename)
                 d.filename,
                 r.extracted_data->>'vendor_name' as vendor,
@@ -1345,7 +1467,8 @@ async def process_message(
                         "intent": "biggest_bills_converted",
                         "active_dataset": "invoice",
                         "result_count": len(converted),
-                        "last_sql": raw_sql
+                        "last_sql": raw_sql,
+                        "protected_sql": True
                     })
                     save_turn(session_id, "assistant", answer, {
                         "intent": "biggest_bills_converted",
@@ -1414,7 +1537,8 @@ async def process_message(
                     "intent": "biggest_bills_converted",
                     "active_dataset": "invoice",
                     "result_count": len(top_results),
-                    "last_sql": raw_sql
+                    "last_sql": raw_sql,
+                    "protected_sql": True
                 })
                 save_turn(session_id, "assistant", answer, {
                     "intent": "biggest_bills_converted",
@@ -1507,7 +1631,8 @@ async def process_message(
                     "intent": "biggest_contracts",
                     "active_dataset": "contract",
                     "result_count": len(top_results),
-                    "last_sql": raw_sql
+                    "last_sql": raw_sql,
+                    "protected_sql": True
                 })
                 save_turn(session_id, "assistant", answer, {
                     "intent": "biggest_contracts",
@@ -1724,7 +1849,8 @@ Return ONLY valid JSON. No explanation. No markdown.
                         "intent": "cross_doc_ranking",
                         "active_dataset": primary_doc,
                         "result_count": len(ranking_results),
-                        "last_sql": ranking_sql
+                        "last_sql": ranking_sql,
+                        "protected_sql": True
                     })
                     save_turn(session_id, "assistant", answer, {
                         "intent": "cross_doc_ranking",
@@ -2100,7 +2226,7 @@ Return ONLY valid JSON. No explanation. No markdown.
                 )
 
             if not risk_scores:
-                answer = "✅ No vendors currently show signs of risk — no duplicates, overdue invoices, or unusual amounts detected."
+                answer = "✅ No vendors currently show signs of risk..."
             else:
                 ranked_risk = sorted(risk_scores.items(), key=lambda x: x[1], reverse=True)
                 selection = parse_ranking_selection(question)
@@ -2114,10 +2240,59 @@ Return ONLY valid JSON. No explanation. No markdown.
                 lines = ["⚠️ Vendor Risk Assessment:\n"] + result["lines"]
                 answer = "\n".join(lines)
 
-            save_turn(session_id, "assistant", answer, {"intent": "vendor_risk_assessment"})
+                # ── Store top risk vendor for follow-up chains ────────────────
+                # Must be INSIDE the else block where ranked_risk is defined
+                top_risk_vendor = ranked_risk[0][0] if ranked_risk else None
+                logger.info(f"[{session_id}] Risk top vendor: {top_risk_vendor}, all ranked: {[v for v,s in ranked_risk[:3]]}")
+                followup_sql = None
+                if top_risk_vendor:
+                    safe_vendor = top_risk_vendor.replace("'", "''")
+                    followup_sql = f"""
+                        SELECT * FROM (
+                            SELECT DISTINCT ON (d.filename)
+                                d.filename,
+                                r.extracted_data->>'vendor_name' as vendor,
+                                r.extracted_data->>'total_amount' as amount,
+                                r.extracted_data->>'currency' as currency,
+                                r.extracted_data->>'issue_date' as issue_date
+                            FROM documents d
+                            JOIN extraction_results r ON r.doc_id = d.id
+                            WHERE r.document_type = 'invoice'
+                            AND d.status = 'done'
+                            AND r.extracted_data->>'vendor_name' ILIKE '%{safe_vendor}%'
+                            ORDER BY d.filename, d.created_at DESC
+                        ) _sub
+                        ORDER BY filename DESC NULLS LAST
+                        LIMIT 200
+                    """
+                    update_active_state(session_id, {
+                        "intent": "vendor_risk_assessment",
+                        "active_dataset": "invoice",
+                        "result_count": len(ranked_risk),
+                        "last_sql": followup_sql,
+                        "top_vendor": top_risk_vendor,
+                        "protected_sql": True
+                    })
+                    logger.info(f"[{session_id}] Risk followup_sql stored, top vendor: {top_risk_vendor}")
+                    set_conversation_focus(session_id, {
+                        "topic": "vendor_risk",
+                        "query_type": "aggregation",
+                        "vendor": top_risk_vendor,
+                        "result_count": len(ranked_risk),
+                        "protected": True
+                    })
+
+            save_turn(session_id, "assistant", answer, {
+                "intent": "vendor_risk_assessment",
+                "top_vendor": top_risk_vendor if risk_scores else None
+            })
+            _verify_focus = get_conversation_focus(session_id)
+            logger.info(f"[{session_id}] Risk handler EXIT focus: {_verify_focus}")
             return {
-                "answer": answer, "intent": "vendor_risk_assessment", "session_id": session_id,
-                "rewritten": None, "sql": None, "results": [], "count": 0
+                "answer": answer, "intent": "vendor_risk_assessment",
+                "session_id": session_id, "rewritten": None,
+                "sql": followup_sql if risk_scores else None,
+                "results": [], "count": 0
             }
         except Exception as e:
             logger.error(f"[{session_id}] Vendor risk assessment failed: {e}", exc_info=True)
@@ -2190,11 +2365,26 @@ Return ONLY valid JSON. No explanation. No markdown.
             ]
             concern_tone = any(w in question.lower() for w in worry_words)
 
-            # ── LLM decides if user wants a specific slice or the full trend ──
-            selection = parse_ranking_selection(question)
-            wants_specific_month = selection.get("selection_type") in (
-                "single_rank", "top_n", "bottom_n", "tier", "average", "compare"
+            # Direction questions ("increasing?", "decreasing?", "trending up?")
+            # should always show the full trend + insight, never a ranking slice
+            direction_question_words = [
+                "increasing", "decreasing", "going up", "going down",
+                "trending", "trend", "direction", "stable", "growing",
+                "rising", "falling", "higher", "lower", "more than before",
+                "changed", "changing", "over time", "getting"
+            ]
+            is_direction_question = any(
+                w in question.lower() for w in direction_question_words
             )
+
+            if is_direction_question:
+                selection = {"selection_type": "full_list"}
+                wants_specific_month = False
+            else:
+                selection = parse_ranking_selection(question)
+                wants_specific_month = selection.get("selection_type") in (
+                    "single_rank", "top_n", "bottom_n", "tier", "average", "compare"
+                )
             wants_count_metric = selection.get("metric") == "count"
 
             if wants_specific_month and monthly_totals:
@@ -2512,11 +2702,54 @@ Return ONLY valid JSON. No explanation. No markdown.
 
                 answer = "\n".join(lines)
 
-            save_turn(session_id, "assistant", answer, {"intent": "vendor_spend_ranking"})
+            # ── Store top vendor as active context for follow-up chains ──────
+            # "show all their invoices" / "what is the total?" etc. need this
+            top_vendor = ranked[0][0] if ranked else None
+            followup_sql = None
+            if top_vendor:
+                safe_vendor = top_vendor.replace("'", "''")
+                followup_sql = f"""
+                    SELECT DISTINCT ON (d.filename)
+                        d.filename,
+                        r.extracted_data->>'vendor_name' as vendor,
+                        NULLIF(REGEXP_REPLACE(r.extracted_data->>'total_amount','[^0-9.]','','g'),'')::numeric as amount,
+                        r.extracted_data->>'currency' as currency,
+                        r.extracted_data->>'issue_date' as issue_date
+                    FROM documents d
+                    JOIN extraction_results r ON r.doc_id = d.id
+                    WHERE r.document_type = 'invoice'
+                    AND d.status = 'done'
+                    AND r.extracted_data->>'vendor_name' ILIKE '%{safe_vendor}%'
+                    ORDER BY d.filename, d.created_at DESC
+                    LIMIT 200
+                """
+                update_active_state(session_id, {
+                    "intent": "vendor_spend_ranking",
+                    "active_dataset": "invoice",
+                    "result_count": len(ranked),
+                    "last_sql": followup_sql,
+                    "top_vendor": top_vendor,
+                    "protected_sql": True
+                })
+            
+            
+                # Always set focus regardless of whether invoice pre-fetch succeeded
+                set_conversation_focus(session_id, {
+                    "topic": "vendor_spend_ranking",
+                    "query_type": "aggregation",
+                    "vendor": top_vendor,
+                    "result_count": len(ranked),
+                    "protected": True
+                })
+
+            save_turn(session_id, "assistant", answer, {
+                "intent": "vendor_spend_ranking",
+                "top_vendor": top_vendor
+            })
             return {
                 "answer": answer, "intent": "vendor_spend_ranking",
                 "session_id": session_id, "rewritten": None,
-                "sql": None, "results": [], "count": 0
+                "sql": followup_sql, "results": [], "count": 0
             }
         except Exception as e:
             logger.error(f"[{session_id}] Vendor spend ranking failed: {e}", exc_info=True)
@@ -2627,8 +2860,6 @@ Return ONLY valid JSON. No explanation. No markdown.
             """
             raw_rows = await execute_query(raw_sql, db)
             rates = await get_exchange_rates()
-
-            import re as _re
 
             def clean_amount(raw):
                 if raw is None:
@@ -2910,7 +3141,46 @@ Answer:
             "count": count
         }
 
-    if intent_override == "list_navigation" and last_results:
+    if intent_override == "list_navigation" and last_results and is_explicitly_scoped:
+        superlative_words = {
+            "smallest": ("amount", min), "cheapest": ("amount", min),
+            "lowest": ("amount", min), "minimum": ("amount", min),
+            "largest": ("amount", max), "biggest": ("amount", max),
+            "highest": ("amount", max), "maximum": ("amount", max),
+            "most expensive": ("amount", max),
+        }
+
+        item = None
+        matched_superlative = None
+        for word, (field, agg_fn) in superlative_words.items():
+            if word in q_lower:
+                valid_items = [r for r in last_results if r.get(field) is not None]
+                if valid_items:
+                    try:
+                        item = agg_fn(valid_items, key=lambda r: float(r.get(field, 0)))
+                        matched_superlative = word
+                    except (TypeError, ValueError):
+                        item = None
+                break
+
+        if item is not None:
+            lines = [f"The {matched_superlative} from previous results:\n"]
+            for k, v in item.items():
+                if v is not None:
+                    lines.append(f"• {k.replace('_', ' ').title()}: {v}")
+            answer = "\n".join(lines)
+            save_turn(session_id, "assistant", answer, {"intent": "list_navigation"})
+            return {
+                "answer": answer,
+                "intent": "list_navigation",
+                "session_id": session_id,
+                "rewritten": None,
+                "sql": None,
+                "results": [item],
+                "count": 1
+            }
+
+        # ── No superlative matched — fall back to your existing ordinal logic ──
         index = 0
         word_ordinals = {
             "first": 0, "second": 1, "third": 2, "fourth": 3, "fifth": 4,
@@ -2966,6 +3236,129 @@ Answer:
         logger.info(f"[{session_id}] Document type mismatch: active={active_dataset}, "
                     f"mentioned={mentioned_types} — forcing standalone")
                 
+
+    # ── Step 5.45: Vendor-context follow-up handler ───────────────────────────
+    # Handles: "show all invoices from the riskiest one",
+    #          "show all their invoices", "show all documents from them"
+    # When conversation_focus has a vendor from a ranking/risk handler,
+    # and question asks for their documents — use stored followup_sql directly.
+    _vendor_doc_followup_words = [
+        "invoice", "invoices", "bill", "bills", "document", "documents",
+        "receipt", "receipts", "contract", "contracts", "all of them",
+        "all their", "show all", "their documents", "their invoices"
+    ]
+    _vendor_ref_words = [
+        "their", "them", "that vendor", "this vendor", "the riskiest",
+        "riskiest one", "the most important", "the top vendor",
+        "from them", "from that", "that company", "this company",
+        "the same vendor", "same one"
+    ]
+    _focus_vendor = conversation_focus.get("vendor") if conversation_focus else None
+    _has_followup_sql = bool(active_state.get("last_sql"))
+    # Require BOTH a pronoun/reference word AND a document word
+    # AND the question must be short (follow-ups are typically brief)
+    # OR contain explicit follow-up pronouns
+    _has_pronoun = any(w in question.lower() for w in _vendor_ref_words)
+    _has_doc_word = any(w in question.lower() for w in _vendor_doc_followup_words)
+    _is_short_followup = len(question.split()) <= 8
+    _has_explicit_pronoun = any(w in question.lower() for w in [
+        "their ", "them ", "they ", "from them", "from that",
+        "the riskiest", "riskiest one", "the most important",
+        "all their", "show their"
+    ])
+
+    _is_vendor_doc_followup = (
+        _focus_vendor and
+        _has_followup_sql and
+        _has_doc_word and
+        (_has_explicit_pronoun or (_has_pronoun and _is_short_followup))
+    )
+    logger.info(f"[{session_id}] Step5.45 check: has_pronoun={_has_pronoun}, has_doc={_has_doc_word}, short={_is_short_followup}, explicit={_has_explicit_pronoun}, focus={_focus_vendor}, sql={_has_followup_sql}")
+    if _is_vendor_doc_followup:
+        logger.info(f"[{session_id}] Vendor-doc follow-up: building fresh SQL for {_focus_vendor}")
+        try:
+            # Detect which document type the user is asking about
+            _doc_type = "invoice"
+            if any(w in question.lower() for w in ["contract", "agreement"]):
+                _doc_type = "contract"
+            elif any(w in question.lower() for w in ["receipt", "kassenbon"]):
+                _doc_type = "receipt"
+
+            _safe_vendor = _focus_vendor.replace("'", "''")
+
+            if _doc_type == "contract":
+                _followup_sql = f"""
+                    SELECT * FROM (
+                        SELECT DISTINCT ON (d.filename)
+                            d.filename,
+                            r.extracted_data->>'parties' as parties,
+                            r.extracted_data->>'value' as amount,
+                            r.extracted_data->>'currency' as currency,
+                            r.extracted_data->>'end_date' as end_date
+                        FROM documents d
+                        JOIN extraction_results r ON r.doc_id = d.id
+                        WHERE r.document_type = 'contract'
+                        AND d.status = 'done'
+                        AND r.extracted_data->>'parties' ILIKE '%{_safe_vendor}%'
+                        ORDER BY d.filename, d.created_at DESC
+                    ) _sub
+                    ORDER BY filename DESC NULLS LAST
+                    LIMIT 200
+                """
+            else:
+                _followup_sql = f"""
+                    SELECT * FROM (
+                        SELECT DISTINCT ON (d.filename)
+                            d.filename,
+                            r.extracted_data->>'vendor_name' as vendor,
+                            r.extracted_data->>'total_amount' as amount,
+                            r.extracted_data->>'currency' as currency,
+                            r.extracted_data->>'issue_date' as issue_date
+                        FROM documents d
+                        JOIN extraction_results r ON r.doc_id = d.id
+                        WHERE r.document_type = '{_doc_type}'
+                        AND d.status = 'done'
+                        AND r.extracted_data->>'vendor_name' ILIKE '%{_safe_vendor}%'
+                        ORDER BY d.filename, d.created_at DESC
+                    ) _sub
+                    ORDER BY filename DESC NULLS LAST
+                    LIMIT 200
+                """
+
+            followup_results = await execute_query(_followup_sql, db)
+            if followup_results:
+                answer = _build_list_response(followup_results, question)
+            else:
+                answer = f"No {_doc_type}s found for {_focus_vendor}."
+
+            set_last_results(session_id, followup_results)
+            update_active_state(session_id, {
+                "intent": intent,
+                "active_dataset": _doc_type,
+                "result_count": len(followup_results),
+                "last_sql": _followup_sql
+            })
+            new_focus = build_conversation_focus(
+                intent, question, followup_results, resolved_context, conversation_focus
+            )
+            set_conversation_focus(session_id, new_focus)
+            save_turn(session_id, "assistant", answer, {
+                "intent": intent,
+                "count": len(followup_results),
+                "results_sample": followup_results[:3]
+            })
+            return {
+                "answer": answer,
+                "intent": intent,
+                "session_id": session_id,
+                "rewritten": None,
+                "sql": _followup_sql,
+                "results": followup_results,
+                "count": len(followup_results)
+            }
+        except Exception as e:
+            logger.error(f"[{session_id}] Vendor-doc follow-up failed: {e}", exc_info=True)
+
     # ── Step 5.55: Universal "Nth item" position query ────────────────────────
     # Handles: "5th invoice", "12th contract", "2 receipts", "show me 75th",
     # "second invoice", "the third contract" — any number (digit or word),
@@ -3095,7 +3488,16 @@ Answer:
             logger.error(f"[{session_id}] Nth item lookup failed: {e}", exc_info=True)
 
     # ── Step 5.6: Query operation planner ───
-    skip_transform = any(k in question.lower() for k in [
+    # ── Explicit scoping to previous results ALWAYS wins over keyword
+    # heuristics below. "only X in above" / "smallest one in those" means
+    # "filter/narrow the previous result set" — never a fresh search,
+    # even if a vendor name or other skip_transform keyword also appears. ──
+    scoping_pattern = re.compile(
+        r'\b(in|from|among|of)\s+(the\s+)?(above|those|these|that list|this list)\b',
+        re.IGNORECASE
+    )
+    is_explicitly_scoped = bool(scoping_pattern.search(question))
+    skip_transform = (not is_explicitly_scoped) and any(k in question.lower() for k in [
         "above ", "below ", "more than", "less than",
         "this month", "last month", "this year",
         "show all invoices", "list all", "show me all",
@@ -3168,7 +3570,169 @@ Answer:
         and active_state.get("last_sql")
     ):
         logger.info(f"[{session_id}] Applying transformation to active dataset")
+
+        # ── Cross-currency sort: intercept before SQL if last_results has
+        # mixed currencies and operation is a sort by amount ──────────────
+        op_name = operation.get("operation")
+        op_params = operation.get("params", {})
+        if (
+            op_name == "sort"
+            and op_params.get("field") in ("amount", None)
+            and last_results
+        ):
+            currencies_in_results = {
+                r.get("currency") for r in last_results
+                if r.get("currency")
+            }
+            has_mixed_currencies = len(currencies_in_results) > 1
+
+            if has_mixed_currencies:
+                logger.info(f"[{session_id}] Mixed-currency sort — using EUR conversion")
+                try:
+                    rates = await get_exchange_rates()
+                    direction = op_params.get("direction", "desc")
+                    limit = op_params.get("limit", 200)
+
+                    def get_base_amount(row):
+                        raw = row.get("amount") or row.get("total_amount") or row.get("value")
+                        cur = row.get("currency")
+                        if raw is None or not cur:
+                            return 0.0
+                        try:
+                            amt = float(str(raw).replace(",", ""))
+                        except (ValueError, TypeError):
+                            return 0.0
+                        converted = convert_to_base(amt, cur, rates)
+                        return converted if converted is not None else 0.0
+
+                    sorted_results = sorted(
+                        last_results,
+                        key=get_base_amount,
+                        reverse=(direction == "desc")
+                    )
+                    sliced = sorted_results[:limit]
+
+                    answer = _build_list_response(sliced, question)
+                    set_last_results(session_id, sliced)
+                    update_active_state(session_id, {
+                        "result_count": len(sliced),
+                        "last_sql": active_state.get("last_sql")
+                    })
+                    new_focus = build_conversation_focus(
+                        intent, question, sliced, resolved_context, conversation_focus
+                    )
+                    set_conversation_focus(session_id, new_focus)
+                    save_turn(session_id, "assistant", answer, {
+                        "intent": intent,
+                        "count": len(sliced),
+                        "results_sample": sliced[:3]
+                    })
+                    return {
+                        "answer": answer,
+                        "intent": intent,
+                        "session_id": session_id,
+                        "rewritten": None,
+                        "sql": active_state.get("last_sql"),
+                        "results": sliced,
+                        "count": len(sliced)
+                    }
+                except Exception as e:
+                    logger.error(f"[{session_id}] Mixed-currency sort failed: {e}", exc_info=True)
+                    # Fall through to normal SQL transform
+                    
+
         try:
+            # ── Special case: date-field queries on a known filename ──────────
+            date_query_words = [
+                "when was it issued", "when was it uploaded", "issue date",
+                "issued", "upload date", "when was", "what date", "when did"
+            ]
+            active_filename = conversation_focus.get("filename") if conversation_focus else None
+            is_date_query = any(w in question.lower() for w in date_query_words)
+
+            if is_date_query and active_filename:
+                safe_filename = active_filename.replace("'", "''")
+                date_sql = f"""
+                    SELECT d.filename,
+                           r.extracted_data->>'vendor_name' as vendor,
+                           r.extracted_data->>'total_amount' as amount,
+                           r.extracted_data->>'currency' as currency,
+                           r.extracted_data->>'issue_date' as issue_date,
+                           d.created_at as uploaded_at
+                    FROM documents d
+                    JOIN extraction_results r ON r.doc_id = d.id
+                    WHERE d.status = 'done'
+                    AND d.filename = '{safe_filename}'
+                    LIMIT 1
+                """
+                is_valid_date, _ = validate_sql(date_sql)
+                if is_valid_date:
+                    date_results = await execute_query(date_sql, db)
+                    if date_results:
+                        answer = _build_list_response(date_results, question)
+                        set_last_results(session_id, date_results)
+                        save_turn(session_id, "assistant", answer, {
+                            "intent": intent,
+                            "count": len(date_results)
+                        })
+                        return {
+                            "answer": answer,
+                            "intent": intent,
+                            "session_id": session_id,
+                            "rewritten": None,
+                            "sql": date_sql,
+                            "results": date_results,
+                            "count": len(date_results)
+                        }
+
+            # ── Also handle: date query with vendor context but no specific filename ──
+            elif is_date_query and not active_filename and conversation_focus:
+                active_vendor = conversation_focus.get("vendor")
+                if active_vendor:
+                    safe_vendor = active_vendor.replace("'", "''")
+                    is_upload_query = any(w in question.lower() for w in [
+                        "uploaded", "upload", "added", "arrived", "when did"
+                    ])
+                    date_field = "d.created_at as uploaded_at" if is_upload_query else \
+                                 "r.extracted_data->>'issue_date' as issue_date"
+                    order_field = "d.created_at" if is_upload_query else \
+                                  "r.extracted_data->>'issue_date'"
+
+                    vendor_date_sql = f"""
+                        SELECT d.filename,
+                               r.extracted_data->>'vendor_name' as vendor,
+                               r.extracted_data->>'total_amount' as amount,
+                               r.extracted_data->>'currency' as currency,
+                               {date_field}
+                        FROM documents d
+                        JOIN extraction_results r ON r.doc_id = d.id
+                        WHERE d.status = 'done'
+                        AND r.document_type = 'invoice'
+                        AND r.extracted_data->>'vendor_name' ILIKE '%{safe_vendor}%'
+                        ORDER BY {order_field} DESC NULLS LAST
+                        LIMIT 1
+                    """
+                    is_valid_date, _ = validate_sql(vendor_date_sql)
+                    if is_valid_date:
+                        date_results = await execute_query(vendor_date_sql, db)
+                        if date_results:
+                            answer = _build_list_response(date_results, question)
+                            set_last_results(session_id, date_results)
+                            save_turn(session_id, "assistant", answer, {
+                                "intent": intent,
+                                "count": len(date_results)
+                            })
+                            return {
+                                "answer": answer,
+                                "intent": intent,
+                                "session_id": session_id,
+                                "rewritten": None,
+                                "sql": vendor_date_sql,
+                                "results": date_results,
+                                "count": len(date_results)
+                            }
+
+            # ── Normal transform path ─────────────────────────────────────────
             transformed_sql = apply_operation_to_sql(
                 active_state["last_sql"],
                 operation,
@@ -3198,6 +3762,7 @@ Answer:
                     intent, question, results, resolved_context, conversation_focus
                 )
                 set_conversation_focus(session_id, new_focus)
+
 
                 save_turn(session_id, "assistant", answer, {
                     "intent": intent,
@@ -3240,7 +3805,7 @@ Answer:
 
 
     # ── Step 7: Generate SQL ──────────────────────
-    sql = generate_sql(sql_input_question, history, resolved_context, all_vendors=all_vendors)
+    sql = generate_sql(sql_input_question, history, resolved_context, all_vendors=all_vendors, previous_sql=active_state.get("last_sql") if active_state else None)
     logger.info(f"[{session_id}] Generated SQL: '{sql}'")
 
     if not sql:
@@ -3342,17 +3907,22 @@ Answer:
     )
 
    # ── Step 12: Save to memory + update state ────
-    new_focus = build_conversation_focus(
-        intent, question, results, resolved_context, conversation_focus
-    )
-
-    # Force duplicate focus when applicable
-    duplicate_keywords = ["duplicate", "repeat", "same invoice", "appears again"]
-    if any(kw in question.lower() for kw in duplicate_keywords):
-        new_focus["topic"] = "duplicate_invoices"
-        new_focus["query_type"] = "duplicate_detection"
-
-    set_conversation_focus(session_id, new_focus)
+    # ── Only update focus if not protected by a Step 3 handler ───────────────
+    current_focus = get_conversation_focus(session_id)
+    if current_focus.get("protected"):
+        # Clear protection flag for next request — protection lasts one turn only
+        current_focus.pop("protected", None)
+        set_conversation_focus(session_id, current_focus)
+    else:
+        new_focus = build_conversation_focus(
+            intent, question, results, resolved_context, conversation_focus
+        )
+        # Force duplicate focus when applicable
+        duplicate_keywords = ["duplicate", "repeat", "same invoice", "appears again"]
+        if any(kw in question.lower() for kw in duplicate_keywords):
+            new_focus["topic"] = "duplicate_invoices"
+            new_focus["query_type"] = "duplicate_detection"
+        set_conversation_focus(session_id, new_focus)
     set_last_results(session_id, results)
 
     # ── Detect active dataset from SQL — universal, not from context ──
@@ -3372,32 +3942,40 @@ Answer:
                           active_state.get("active_dataset", "invoice")
 
     # ── Update active resultset state ──
-    new_state = {
-        "intent": intent,
-        "active_dataset": detected_dataset,
-        "filters": {
-            k: v for k, v in {
-                "currency": resolved_context.get("currency"),
-                "vendor": resolved_context.get("vendor_name"),
-                "time_period": resolved_context.get("time_period"),
-                "amount_gt": resolved_context.get("amount_reference")
-            }.items() if v
-        },
-        "entities": {
-            k: v for k, v in {
-                "vendor": new_focus.get("vendor"),
-                "currency": new_focus.get("currency"),
-                "amount": new_focus.get("amount"),
-                "filename": new_focus.get("filename")
-            }.items() if v
-        },
-        "result_count": len(results),
-        "shown_count": min(len(results), 10),
-        "last_sql": sql,
-        "query_scope": "filtered" if resolved_context.get("vendor_name") or
-                       resolved_context.get("currency") else "all"
-    }
-    set_active_state(session_id, new_state)
+    # ── Only overwrite active_state if not protected by a Step 3 handler ─────
+    _current_state = get_active_state(session_id)
+    if _current_state.get("protected_sql"):
+        # Keep the protected last_sql — only clear the protection flag
+        _current_state["protected_sql"] = False
+        _current_state["result_count"] = len(results)
+        set_active_state(session_id, _current_state)
+    else:
+        new_state = {
+            "intent": intent,
+            "active_dataset": detected_dataset,
+            "filters": {
+                k: v for k, v in {
+                    "currency": resolved_context.get("currency"),
+                    "vendor": resolved_context.get("vendor_name"),
+                    "time_period": resolved_context.get("time_period"),
+                    "amount_gt": resolved_context.get("amount_reference")
+                }.items() if v
+            },
+            "entities": {
+                k: v for k, v in {
+                    "vendor": new_focus.get("vendor"),
+                    "currency": new_focus.get("currency"),
+                    "amount": new_focus.get("amount"),
+                    "filename": new_focus.get("filename")
+                }.items() if v
+            },
+            "result_count": len(results),
+            "shown_count": min(len(results), 10),
+            "last_sql": sql,
+            "query_scope": "filtered" if resolved_context.get("vendor_name") or
+                           resolved_context.get("currency") else "all"
+        }
+        set_active_state(session_id, new_state)
     logger.info(f"[{session_id}] Active state saved: dataset={detected_dataset} sql_len={len(sql)}")
 
     save_turn(session_id, "assistant", answer, {
