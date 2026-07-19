@@ -81,6 +81,10 @@ def classify_intent(question: str, history: str = "") -> str:
         "is spending", "are we spending", "do they just", "or do they",
         "more invoices", "more contracts", "more receipts",
         "important than", "riskier than", "bigger than", "smaller than",
+        "do they have", "do they also", "do they appear",
+        "have contracts", "have invoices", "have any",
+        "is there a contract", "are there contracts",
+        "do we have", "do they",
     ]
     if any(p in q_lower for p in analytical_patterns):
         return "sql_analytics"
