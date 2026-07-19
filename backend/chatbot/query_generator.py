@@ -1,4 +1,5 @@
 import os
+import re as _re
 import re 
 import logging
 from langchain_core.prompts import ChatPromptTemplate
@@ -99,6 +100,12 @@ OVERDUE + EXPIRING CROSS-DOC PATTERN:
 "overdue invoices from vendors who also have expiring contracts" →
 Primary result: overdue INVOICES (due_date < CURRENT_DATE)
 Filter: vendor must appear in a contract expiring within 30 days
+
+PREVIOUS QUERY (if this is a follow-up, use its filters as context):
+{previous_sql}
+
+If the user says "only X" or "just X" or filters by vendor/currency/amount,
+apply that filter ON TOP OF the previous query's filters (currency, amount threshold, doc type).
 
 SELECT DISTINCT ON (d.filename) d.filename,
     r.extracted_data->>'vendor_name' as vendor,
@@ -552,6 +559,20 @@ def fix_distinct_order_conflict(sql: str) -> str:
     """
     sql_upper = sql.upper()
 
+    # ── Guard: don't wrap if SQL has complex nested IN/EXISTS subqueries ──────
+    # Wrapping causes "syntax error at or near _sub" when inner query has
+    # unclosed nested subqueries (e.g. IN (SELECT ... EXISTS (...)))
+    if "IN (" in sql_upper and "EXISTS (" in sql_upper:
+        depth = 0
+        for ch in sql:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+        if depth != 0:
+            logger.info("fix_distinct: skipping wrap — unbalanced parentheses in nested subquery")
+            return sql
+
     if "DISTINCT ON" not in sql_upper:
         return sql
 
@@ -606,6 +627,51 @@ def fix_distinct_order_conflict(sql: str) -> str:
     logger.info(f"fix_distinct: wrapped in subquery, outer sort={outer_sort} {direction}")
     return rewritten
 
+def fix_spurious_duplicate_check(sql: str, question: str) -> str:
+    """
+    Remove has_duplicate CASE expression when user didn't ask about duplicates.
+    The LLM sometimes adds this check speculatively, causing all NULL-invoice-number
+    rows to be incorrectly flagged as duplicates.
+    """
+    duplicate_intent_words = [
+        "duplicate", "repeat", "same invoice", "appears twice",
+        "invoice number", "repeated"
+    ]
+    if any(w in question.lower() for w in duplicate_intent_words):
+        return sql  # user asked about duplicates — keep the check
+
+    # Remove the entire has_duplicate CASE expression
+    sql = re.sub(
+        r",?\s*CASE\s+WHEN\s+r\d*\.extracted_data->>'invoice_number'\s+IN\s*"
+        r"\(\s*SELECT[^)]+HAVING COUNT\(\*\)\s*>\s*1\s*\)\s*"
+        r"THEN\s+'Yes'\s+ELSE\s+'No'\s+END\s+as\s+has_duplicate",
+        "",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    if "has_duplicate" not in sql:
+        logger.info("fix_spurious_duplicate_check: removed unnecessary duplicate check")
+    return sql
+
+def fix_duplicate_null_check(sql: str) -> str:
+    """
+    Fix duplicate invoice number detection subquery to exclude NULLs.
+    Without this, all invoices with NULL invoice_number are flagged as duplicates.
+    """
+    # Pattern: HAVING COUNT(*) > 1 inside a duplicate-check subquery
+    # Add AND invoice_number IS NOT NULL AND invoice_number != '' to the WHERE clause
+    sql = re.sub(
+        r"(WHERE\s+r\d*\.document_type\s*=\s*'invoice'\s*\n?\s*"
+        r"AND\s+r\d*\.extracted_data->>'invoice_number'\s+IS\s+NOT\s+NULL)"
+        r"(\s*\n?\s*GROUP BY\s+r\d*\.extracted_data->>'invoice_number'\s*\n?\s*HAVING COUNT\(\*\)\s*>\s*1)",
+        r"\1\n    AND r2.extracted_data->>'invoice_number' != ''"
+        r"\2",
+        sql,
+        flags=re.IGNORECASE
+    )
+    if "HAVING COUNT(*) > 1" in sql:
+        logger.info("fix_duplicate_null_check: applied")
+    return sql
 
 def fix_vendor_exact_match(sql: str) -> str:
     """
@@ -641,6 +707,23 @@ def fix_vendor_canonical_names(sql: str, all_vendors: list) -> str:
         "EUR", "USD", "GBP", "JPY", "CHF", "INR", 
         "CAD", "AUD", "CNY", "SEK", "NOK", "DKK"
     }
+
+    # ── Never replace PDF filenames — they are document identifiers, not
+    # vendor names. Protect all 'something.pdf' strings from being treated
+    # as vendor candidates before any fuzzy matching runs. ──
+    pdf_pattern = re.compile(r"'[^']*\.pdf'", re.IGNORECASE)
+    protected = {}
+    placeholder_idx = 0
+
+    def protect_filename(match):
+        nonlocal placeholder_idx
+        key = f"__PDF_PLACEHOLDER_{placeholder_idx}__"
+        protected[key] = match.group(0)
+        placeholder_idx += 1
+        return f"'{key}'"
+
+    sql = pdf_pattern.sub(protect_filename, sql)
+
     def replace_vendor(match_str):
         # Extract the quoted string value
         quoted = re.findall(r"'([^']+)'", match_str)
@@ -709,6 +792,10 @@ def fix_vendor_canonical_names(sql: str, all_vendors: list) -> str:
         sql,
         flags=re.IGNORECASE
     )
+
+    # ── Restore protected filenames ──
+    for key, original in protected.items():
+        sql = sql.replace(f"'{key}'", original)
 
     return sql
 
@@ -1210,11 +1297,11 @@ LIMIT 200"""
 # LIMIT 200"""
 
 def generate_sql(
-    question: str,
-    history: str = "",
-    resolved_context: dict = None,
-    all_vendors: list = None
-) -> str:
+    question, history="", 
+    resolved_context=None, 
+    all_vendors=None, 
+    previous_sql=None
+    )-> str:
     """Generate SQL from natural language question."""
     context = resolved_context or {}
     amount_ref = context.get("amount_reference", "0") or "0"
@@ -1226,7 +1313,8 @@ def generate_sql(
                 "question": question,
                 "history": history or "No history",
                 "resolved_context": str(context),
-                "amount_reference": amount_ref
+                "amount_reference": amount_ref,
+                "previous_sql": previous_sql or "None" 
             }
         )
 
@@ -1239,10 +1327,12 @@ def generate_sql(
         sql = sql.strip()
         sql = fix_missing_join_on(sql)
         sql = fix_jsonb_cast(sql)
+        sql = fix_duplicate_null_check(sql)
         sql = fix_distinct_order_conflict(sql)
         sql = fix_vendor_exact_match(sql) 
         if all_vendors:
             sql = fix_vendor_canonical_names(sql, all_vendors)
+        sql = fix_spurious_duplicate_check(sql, question)
         sql = fix_missing_currency_filter(sql, question)
         sql = fix_nullif_syntax(sql)
         sql = fix_cross_document_exists(sql, question)
