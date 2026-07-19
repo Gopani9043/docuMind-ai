@@ -177,13 +177,28 @@ def resolve_context(
 
     if actual_results:
         first = actual_results[0]
-        raw_vendor = first.get("vendor") or first.get("vendor_name")
-        if raw_vendor:
-            default_context["vendor_name"] = raw_vendor
+        # Only inherit currency — never auto-inject vendor from last results
+        # unless the question explicitly references a vendor or "that vendor"/"this vendor"
+        # Vendor injection causes false filtering when user asks generic follow-ups
+        # like "only above 50000" which should apply to ALL previous results not just [0]
         if first.get("currency"):
             default_context["currency"] = first["currency"]
         if first.get("amount"):
             default_context["amount_reference"] = str(first["amount"])
+        # Never inject vendor from last_results if conversation_focus is protected
+        # (a Step 3 handler explicitly set the vendor context for follow-up)
+        focus_is_protected = bool(
+            conversation_focus.get("protected") if conversation_focus else False
+        )
+
+        vendor_reference_words = [
+            "that vendor", "this vendor", "same vendor", "their", "they",
+            "that company", "this company", "from them", "from that"
+        ]
+        if not focus_is_protected and any(w in q_lower for w in vendor_reference_words):
+            raw_vendor = first.get("vendor") or first.get("vendor_name")
+            if raw_vendor:
+                default_context["vendor_name"] = raw_vendor
 
     # ── Carry forward active filters from conversation focus ──────────────────
     # This ensures "smallest one" after "above 10000 EUR" keeps all filters
@@ -272,13 +287,19 @@ def resolve_context(
                     vendor_like.append(w)
 
         if vendor_like:
-            logger.info(f"Fast path: proper noun entity detected {vendor_like} — fresh query")
-            # Clear ALL inherited context — this is a fresh entity question
+            logger.info(f"Fast path: proper noun entity detected {vendor_like} — fresh query, preserving filters")
+            # Preserve currency and amount filters from conversation focus
+            # so "only BrightPath" after "EUR invoices above 10000" keeps those filters
+            preserved_currency = None
+            preserved_amount = None
+            if conversation_focus:
+                preserved_currency = conversation_focus.get("currency")
+                preserved_amount = conversation_focus.get("amount")
             return {
                 "document_type": None,
-                "vendor_name": None,
-                "currency": None,
-                "amount_reference": None,
+                "vendor_name": None,  # will be resolved via vendor hint injection
+                "currency": preserved_currency,
+                "amount_reference": str(preserved_amount) if preserved_amount else None,
                 "time_period": None,
                 "comparison_requested": False,
                 "previous_query_type": None,
