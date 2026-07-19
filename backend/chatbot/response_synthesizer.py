@@ -370,7 +370,8 @@ def synthesize_response(
 
 
         # ── List query — generate in Python, no LLM ──
-        return _build_list_response(results, original_question)
+        if intent in ("sql_analytics",) or len(results) > 1:
+            return _build_list_response(results, original_question)
 
     except Exception as e:
         logger.error(f"Response synthesis failed: {e}")
@@ -625,16 +626,18 @@ def _build_list_response(results: list, question: str) -> str:
         has_dup = row.get("has_duplicate", "")
         issue_date = row.get("issue_date", "")
         overdue_days = row.get("overdue_days", "")
+        uploaded_at = row.get("uploaded_at", "")
 
         # Detect missing fields
         missing = []
-        if not row.get("value") and not row.get("amount") and not row.get("total"):
+        if not row.get("value") and not row.get("amount") and not row.get("total") \
+                and not row.get("uploaded_at"):
             missing.append("value")
         if not row.get("due_date") and not row.get("end_date") and not row.get("start_date") and "date" in question.lower():
             missing.append("date")
         if not row.get("vendor") and not row.get("vendor_name") and not row.get("parties"):
             missing.append("vendor")
-        if not row.get("currency"):
+        if not row.get("currency") and not row.get("uploaded_at"):
             missing.append("currency")
         missing_str = f" | ⚠️ missing: {', '.join(missing)}" if missing else ""
 
@@ -650,7 +653,18 @@ def _build_list_response(results: list, question: str) -> str:
             lines.append(line.strip())
         elif filename and vendor and amount:
             line = f"{i}. {filename} | {vendor} | {amount} {currency}{missing_str}".strip()
-            if issue_date:
+            if uploaded_at:
+                # Format uploaded_at — strip microseconds for readability
+                try:
+                    from datetime import datetime as _dt
+                    if hasattr(uploaded_at, 'strftime'):
+                        uploaded_str = uploaded_at.strftime("%Y-%m-%d %H:%M")
+                    else:
+                        uploaded_str = str(uploaded_at)[:16]
+                    line += f" | uploaded: {uploaded_str}"
+                except Exception:
+                    line += f" | uploaded: {uploaded_at}"
+            elif issue_date:
                 line += f" | issued: {issue_date}"
             if has_dup == "Yes":
                 line += " ⚠️ DUPLICATE"
