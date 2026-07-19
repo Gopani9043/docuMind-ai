@@ -2020,8 +2020,97 @@ Return ONLY valid JSON. No explanation. No markdown.
         "missing information", "missing fields", "what's missing",
         "any incomplete", "missing values"
     ]
+    # logger.info(f"[{session_id}] PRE-MISSING-DATA CHECK: special_intent='{special_intent}'")
     if special_intent == "missing_data":
         logger.info(f"[{session_id}] Missing data audit triggered")
+        # ── Detect specific missing field request ──────────────────────────
+        # "show invoices with missing vendor names" → targeted query
+        # vs "any missing data?" → full audit
+        specific_field = None
+        specific_doc_type = None
+
+        if any(w in question.lower() for w in ["vendor name", "vendor names", "missing vendor"]):
+            specific_field = "vendor_name"
+        elif any(w in question.lower() for w in ["due date", "due dates", "missing due"]):
+            specific_field = "due_date"
+        elif any(w in question.lower() for w in ["amount", "value", "missing amount", "missing value"]):
+            specific_field = "total_amount"
+        elif any(w in question.lower() for w in ["currency", "missing currency"]):
+            specific_field = "currency"
+        elif any(w in question.lower() for w in ["end date", "expiry", "missing end"]):
+            specific_field = "end_date"
+
+        if any(w in question.lower() for w in ["invoice", "bill", "rechnung"]):
+            specific_doc_type = "invoice"
+        elif any(w in question.lower() for w in ["contract", "agreement"]):
+            specific_doc_type = "contract"
+        elif any(w in question.lower() for w in ["receipt", "kassenbon"]):
+            specific_doc_type = "receipt"
+
+        if specific_field and specific_doc_type:
+            logger.info(f"[{session_id}] Specific missing field: {specific_field} in {specific_doc_type}s")
+
+            if specific_field == "vendor_name":
+                null_check = "(r.extracted_data->>'vendor_name' IS NULL OR r.extracted_data->>'vendor_name' = '')"
+            elif specific_field == "due_date":
+                null_check = "(r.extracted_data->>'due_date' IS NULL OR r.extracted_data->>'due_date' = '')"
+            elif specific_field == "total_amount":
+                null_check = "(r.extracted_data->>'total_amount' IS NULL OR r.extracted_data->>'total_amount' = '')"
+            elif specific_field == "currency":
+                null_check = "(r.extracted_data->>'currency' IS NULL OR r.extracted_data->>'currency' = '')"
+            elif specific_field == "end_date":
+                null_check = "(r.extracted_data->>'end_date' IS NULL OR r.extracted_data->>'end_date' = '')"
+            else:
+                null_check = None
+
+            if null_check:
+                specific_sql = f"""
+                    SELECT * FROM (
+                        SELECT DISTINCT ON (d.filename)
+                            d.filename,
+                            r.extracted_data->>'vendor_name' as vendor,
+                            r.extracted_data->>'parties' as parties,
+                            r.extracted_data->>'total_amount' as amount,
+                            r.extracted_data->>'currency' as currency,
+                            r.extracted_data->>'issue_date' as issue_date
+                        FROM documents d
+                        JOIN extraction_results r ON r.doc_id = d.id
+                        WHERE r.document_type = '{specific_doc_type}'
+                        AND d.status = 'done'
+                        AND {null_check}
+                        ORDER BY d.filename, d.created_at DESC
+                    ) _sub
+                    ORDER BY filename DESC NULLS LAST
+                    LIMIT 200
+                """
+                is_valid, _ = validate_sql(specific_sql)
+                if is_valid:
+                    specific_results = await execute_query(specific_sql, db)
+                    if specific_results:
+                        answer = _build_list_response(specific_results, question)
+                    else:
+                        answer = f"No {specific_doc_type}s found with missing {specific_field.replace('_', ' ')}."
+                    set_last_results(session_id, specific_results)
+                    update_active_state(session_id, {
+                        "intent": "missing_data_specific",
+                        "active_dataset": specific_doc_type,
+                        "result_count": len(specific_results),
+                        "last_sql": specific_sql
+                    })
+                    save_turn(session_id, "assistant", answer, {
+                        "intent": "missing_data_specific",
+                        "count": len(specific_results)
+                    })
+                    return {
+                        "answer": answer,
+                        "intent": "missing_data_specific",
+                        "session_id": session_id,
+                        "rewritten": None,
+                        "sql": specific_sql,
+                        "results": specific_results,
+                        "count": len(specific_results)
+                    }
+
         try:
             invoice_sql = """
                 SELECT
