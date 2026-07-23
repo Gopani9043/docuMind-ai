@@ -630,14 +630,28 @@ def _build_list_response(results: list, question: str) -> str:
 
         # Detect missing fields
         missing = []
-        if not row.get("value") and not row.get("amount") and not row.get("total") \
-                and not row.get("uploaded_at"):
+        # Detect row type
+        is_contract_row = bool(row.get("parties")) and not row.get("vendor_name") and not row.get("vendor")
+        has_amount = bool(row.get("amount") or row.get("value") or row.get("total") or row.get("total_amount"))
+        has_date = bool(row.get("uploaded_at") or row.get("issue_date") or row.get("end_date") or row.get("due_date"))
+
+        # Only flag missing value if genuinely absent AND not a date-only query
+        if not has_amount and not has_date:
             missing.append("value")
-        if not row.get("due_date") and not row.get("end_date") and not row.get("start_date") and "date" in question.lower():
+
+        # Only flag missing date if user asked about dates
+        if not row.get("due_date") and not row.get("end_date") and not row.get("start_date") \
+                and "date" in question.lower():
             missing.append("date")
-        if not row.get("vendor") and not row.get("vendor_name") and not row.get("parties"):
+
+        # Only flag missing vendor for non-contract rows
+        # Contracts legitimately have no vendor_name — they use parties
+        if not row.get("vendor") and not row.get("vendor_name") and not row.get("parties") \
+                and not is_contract_row:
             missing.append("vendor")
-        if not row.get("currency") and not row.get("uploaded_at"):
+
+        # Only flag missing currency if genuinely absent
+        if not row.get("currency") and not row.get("uploaded_at") and not has_date:
             missing.append("currency")
         missing_str = f" | ⚠️ missing: {', '.join(missing)}" if missing else ""
 

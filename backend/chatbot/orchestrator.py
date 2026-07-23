@@ -807,6 +807,11 @@ async def process_message(
     conversation_focus = get_conversation_focus(session_id)
     last_results = get_last_results(session_id)
     active_state = get_active_state(session_id)
+    # Pre-fetch vendor list for Step 3 handlers that need it early
+    try:
+        all_vendors = await get_all_vendor_names(db)
+    except Exception:
+        all_vendors = []
 
     logger.info(f"[{session_id}] Focus: {conversation_focus}")
 
@@ -931,114 +936,142 @@ async def process_message(
             except Exception as e:
                 logger.error(f"[{session_id}] Vendor fuzzy matching failed: {e}", exc_info=True)
 
-    # ── Step 3e: Handle repeat/duplicate detection ─
-    repeat_keywords = [
-        "repeat", "repeated", "appears again", "same invoice",
-        "invoice repeat", "which invoice repeat", "most repeated",
-        "duplicate invoice", "duplicate invoices", "find duplicate"
+    # ── Step 3e: Show all documents from a specific vendor ────────────────────
+    all_docs_keywords = [
+        "all documents from", "all docs from", "show documents from",
+        "show all documents from", "everything from", "all files from",
+        "documents from", "files from"
     ]
-    # Skip if question has extra filters — let Step 4 decompose it properly
-    _q = question.lower()
-    has_extra_filters = any([
-        any(c in _q for c in ["eur", "usd", "gbp", "jpy", "chf", "inr"]),
-        bool(re.search(r'\b(above|below|over|under|more than|less than|greater than)\s+\d+', _q)),
-        any(k in _q for k in ["oldest", "newest", "latest", "earliest", "highest", "lowest"]),
-        any(k in _q for k in ["show all", "only", "from vendor", "and show", "and find"]),
-        any(k in _q for k in ["expiring", "expiring contracts", "who also", "that also"]),  # ← ADD THIS
-    ])
+    _q_lower_3e = question.lower()
 
-    if any(kw in question.lower() for kw in repeat_keywords) and not has_extra_filters:
-        logger.info(f"[{session_id}] Repeat invoice detection triggered")
+    if any(kw in _q_lower_3e for kw in all_docs_keywords):
+        vendor_hint = None
+        # Match vendor from all_vendors list
+        for vendor in (all_vendors or []):
+            for part in vendor.split():
+                if len(part) > 3 and part.lower() in _q_lower_3e:
+                    vendor_hint = vendor
+                    break
+            if vendor_hint:
+                break
+        # Fall back to resolved context
+        if not vendor_hint and resolved_context.get("vendor_name"):
+            vendor_hint = resolved_context["vendor_name"]
 
-        q_lower = question.lower()
-        is_most = any(k in q_lower for k in [
-            "most", "highest", "top", "which one", "maximum", "max"
-        ])
-        is_least = any(k in q_lower for k in [
-            "least", "less", "lowest", "minimum", "min", "fewest", "rarest"
-        ])
-        repeat_order = "ASC" if is_least else "DESC"
-        repeat_limit = "LIMIT 20"
+        logger.info(f"[{session_id}] Step 3e triggered, vendor_hint={vendor_hint}, all_vendors_count={len(all_vendors) if all_vendors else 0}")
 
-        repeat_sql = f"""
-            SELECT
-                r.extracted_data->>'invoice_number' as invoice_number,
-                MAX(r.extracted_data->>'vendor_name') as vendor,
-                MAX(r.extracted_data->>'total_amount') as amount,
-                MAX(r.extracted_data->>'currency') as currency,
-                COUNT(*) as repeat_count
-            FROM documents d
-            JOIN extraction_results r ON r.doc_id = d.id
-            WHERE d.status = 'done'
-            AND r.document_type = 'invoice'
-            AND r.extracted_data->>'invoice_number' IS NOT NULL
-            AND r.extracted_data->>'invoice_number' != ''
-            GROUP BY
-                r.extracted_data->>'invoice_number'
-            HAVING COUNT(*) > 1
-            ORDER BY repeat_count {repeat_order}
-            {repeat_limit}
-        """
-        is_valid, _ = validate_sql(repeat_sql)
-        if is_valid:
+        if vendor_hint:
+            safe_vendor = vendor_hint.replace("'", "''")
+            invoice_sql = f"""
+                SELECT * FROM (
+                    SELECT DISTINCT ON (d.filename)
+                        d.filename,
+                        'invoice' as doc_type,
+                        r.extracted_data->>'vendor_name' as vendor,
+                        r.extracted_data->>'total_amount' as amount,
+                        r.extracted_data->>'currency' as currency,
+                        r.extracted_data->>'issue_date' as issue_date
+                    FROM documents d
+                    JOIN extraction_results r ON r.doc_id = d.id
+                    WHERE r.document_type = 'invoice'
+                    AND d.status = 'done'
+                    AND r.extracted_data->>'vendor_name' ILIKE '%{safe_vendor}%'
+                    ORDER BY d.filename, d.created_at DESC
+                ) _sub ORDER BY filename DESC NULLS LAST LIMIT 200
+            """
+            contract_sql = f"""
+                SELECT * FROM (
+                    SELECT DISTINCT ON (d.filename)
+                        d.filename,
+                        'contract' as doc_type,
+                        r.extracted_data->>'parties' as vendor,
+                        r.extracted_data->>'value' as amount,
+                        r.extracted_data->>'currency' as currency,
+                        r.extracted_data->>'end_date' as end_date
+                    FROM documents d
+                    JOIN extraction_results r ON r.doc_id = d.id
+                    WHERE r.document_type = 'contract'
+                    AND d.status = 'done'
+                    AND r.extracted_data->>'parties' ILIKE '%{safe_vendor}%'
+                    ORDER BY d.filename, d.created_at DESC
+                ) _sub ORDER BY filename DESC NULLS LAST LIMIT 200
+            """
             try:
-                repeat_results = await execute_query(repeat_sql, db)
-                if repeat_results:
-                    # For "most/highest" queries, show all invoices tied at the top count
-                    if is_most or is_least:
-                        top_count = repeat_results[0].get("repeat_count")
-                        repeat_results = [
-                            r for r in repeat_results
-                            if str(r.get("repeat_count")) == str(top_count)
-                        ]
+                invoice_results = await execute_query(invoice_sql, db)
+                contract_results = await execute_query(contract_sql, db)
+                all_results = invoice_results + contract_results
 
-                    lines = []
-                    for i, r in enumerate(repeat_results[:10], 1):
-                        lines.append(
-                            f"{i}. {r.get('invoice_number', 'unknown')} | "
-                            f"{r.get('vendor', 'unknown')} | "
-                            f"{r.get('repeat_count')} times"
-                        )
-                    answer = "\n".join(lines)
-                    if len(repeat_results) > 10:
-                        answer += f"\n... and {len(repeat_results) - 10} more"
+                if not all_results:
+                    answer = f"No documents found for {vendor_hint}."
                 else:
-                    answer = "No repeated invoices found."
+                    lines = [f"📁 All documents from {vendor_hint}:\n"]
+                    if invoice_results:
+                        lines.append(f"📄 Invoices ({len(invoice_results)}):")
+                        for i, row in enumerate(invoice_results, 1):
+                            amt = row.get("amount", "")
+                            cur = row.get("currency", "")
+                            issued = row.get("issue_date", "")
+                            line = f"  {i}. {row.get('filename')} | {amt} {cur}"
+                            if issued:
+                                line += f" | issued: {issued}"
+                            lines.append(line.strip())
+                    if contract_results:
+                        lines.append(f"\n📋 Contracts ({len(contract_results)}):")
+                        for i, row in enumerate(contract_results, 1):
+                            raw_parties = row.get("vendor", "")
+                            try:
+                                import json as _j
+                                parsed = _j.loads(raw_parties)
+                                if isinstance(parsed, list):
+                                    names = [
+                                        p.get("name", "") if isinstance(p, dict) else str(p)
+                                        for p in parsed
+                                        if (p.get("name", "") if isinstance(p, dict) else str(p))
+                                        not in ("[MISSING_COMPANY_NAME]", "PARTY B (CLIENT)", "")
+                                    ]
+                                    parties_str = " / ".join(names)
+                                else:
+                                    parties_str = str(raw_parties)
+                            except Exception:
+                                parties_str = str(raw_parties)
+                            amt = row.get("amount", "N/A")
+                            cur = row.get("currency", "")
+                            end = row.get("end_date", "")
+                            line = f"  {i}. {row.get('filename')} | {parties_str} | {amt} {cur}"
+                            if end:
+                                line += f" | expires: {end}"
+                            lines.append(line.strip())
 
-                new_focus = build_conversation_focus(
-                    "duplicate_detection", question, repeat_results, {}, conversation_focus
-                )
-                new_focus["topic"] = "duplicate_invoices"
-                new_focus["query_type"] = "duplicate_detection"
-                set_conversation_focus(session_id, new_focus)
-                set_last_results(session_id, repeat_results)
+                    lines.append(f"\n{len(all_results)} total documents.")
+                    answer = "\n".join(lines)
 
+                set_last_results(session_id, all_results)
                 update_active_state(session_id, {
-                    "intent": "duplicate_detection",
-                    "active_dataset": "invoices",
-                    "filters": {},
-                    "result_count": len(repeat_results),
-                    "last_sql": repeat_sql,
-                    "protected_sql": True
+                    "intent": "all_vendor_docs",
+                    "active_dataset": "mixed",
+                    "result_count": len(all_results),
+                    "last_sql": invoice_sql
                 })
-
+                set_conversation_focus(session_id, {
+                    "topic": "all_vendor_docs",
+                    "vendor": vendor_hint,
+                    "result_count": len(all_results)
+                })
                 save_turn(session_id, "assistant", answer, {
-                    "intent": "duplicate_detection",
-                    "sql": repeat_sql,
-                    "count": len(repeat_results),
-                    "results_sample": repeat_results[:3]
+                    "intent": "all_vendor_docs",
+                    "count": len(all_results)
                 })
                 return {
                     "answer": answer,
-                    "intent": "duplicate_detection",
+                    "intent": "all_vendor_docs",
                     "session_id": session_id,
                     "rewritten": None,
-                    "sql": repeat_sql,
-                    "results": repeat_results,
-                    "count": len(repeat_results)
+                    "sql": invoice_sql,
+                    "results": all_results,
+                    "count": len(all_results)
                 }
             except Exception as e:
-                logger.error(f"[{session_id}] Repeat detection failed: {e}", exc_info=True)
+                logger.error(f"[{session_id}] All-docs-from-vendor failed: {e}", exc_info=True)
 
     # ── Step 3f: Handle overdue/expiring with safe Python SQL ────
     overdue_keywords = ["overdue", "past due", "late payment", "unpaid", "outstanding"]
@@ -1650,6 +1683,7 @@ async def process_message(
                 }
             except Exception as e:
                 logger.error(f"[{session_id}] Biggest contracts failed: {e}", exc_info=True)
+
 
     # ── Step 3j: Top-N + related docs — LLM extracts params, Python executes ─
     q_lower = question.lower()  # define locally for Step 3j
@@ -3884,7 +3918,8 @@ Answer:
 
     # ── Step 6.5: Resolve vendor mentions to canonical DB names ──
     try:
-        all_vendors = await get_all_vendor_names(db)
+        if not all_vendors:
+            all_vendors = await get_all_vendor_names(db)
         sql_input_question = resolve_vendor_names_in_question(rewritten, all_vendors)
         if sql_input_question != rewritten:
             logger.info(f"[{session_id}] Vendor resolved for SQL: '{rewritten}' -> '{sql_input_question}'")

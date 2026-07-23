@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y \
 # Install heavy packages first — cached separately
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir sentence-transformers==2.7.0 faiss-cpu
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
 # Install remaining packages
 COPY requirements.txt .
