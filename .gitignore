@@ -24,3 +24,4 @@ backend/vector_stores/
 .DS_Store
 Thumbs.dbredis_monitor.txt
 tests/test_output.txt
+redis_monitor.txt
