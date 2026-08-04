@@ -81,6 +81,8 @@ most_important_vendor
   "Who is our medium importance vendor?", "Which vendor is moderately
   important?", "Who is our second most important vendor?", "Show our
   top 3 most important vendors", "Is vendor X more important than vendor Y?"
+  "Welcher Lieferant ist am wichtigsten?" → most_important_vendor
+  "Wer ist unser wichtigster Lieferant?" → most_important_vendor
 
 DISAMBIGUATION RULE — CRITICAL:
 If the question starts with "which month", "what month", "which period",
@@ -103,6 +105,9 @@ vendor_spend_ranking
   financial totals. Must work correctly across multiple currencies.
   This is the category for ALL vendor-total and vendor-aggregate
   questions, whether about invoices or contracts.
+  NEVER use for: "which vendor has the most documents/files/invoices (count)"
+  NEVER use for: "who uploaded the most", "which vendor has most records"
+  (those ask about DOCUMENT COUNT, not money spent)
 
   Examples (invoices): "Which vendor did I pay the most?", "Top 5 vendors
   by total paid", "Who do we spend the most with?", "Show top 3 vendors
@@ -134,6 +139,10 @@ none
   "Total spending in EUR"
   "Compare this month vs last month"
   "Show contracts expiring soon"
+  "Which vendor has the most total documents?" → none (document count query)
+  - "Which vendor has the most invoices?" → none (count query)
+  - "Who has the most files?" → none (count query)
+  - "Which vendor appears most often?" → none (frequency query)
 
 Also detect if the question carries a CONCERN or WORRY tone —
 the user is anxious about the data, not just curious.

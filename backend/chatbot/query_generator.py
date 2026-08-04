@@ -71,6 +71,25 @@ EXAMPLES (using PARSED_DATE to mean the full CASE expression above):
 - this year = PARSED_DATE >= DATE_TRUNC('year', CURRENT_DATE)
 - last 30 days = PARSED_DATE >= CURRENT_DATE - INTERVAL '30 days'
 
+- When user asks to SHOW/LIST all documents from a SPECIFIC NAMED vendor, do NOT filter by document_type — include both invoices and contracts
+- EXCEPTION: when COUNTING or RANKING vendors (GROUP BY vendor), ALWAYS filter to invoices only (document_type = 'invoice') because contracts store vendor in 'parties' not 'vendor_name'
+Question: Show all documents from EuroData AG
+SQL: SELECT d.filename, r.document_type, r.extracted_data->>'vendor_name' as vendor...
+     WHERE (r.extracted_data->>'vendor_name' ILIKE '%EuroData AG%' 
+     OR r.extracted_data->>'parties' ILIKE '%EuroData AG%')
+     -- NO document_type filter (listing specific vendor's docs)
+Question: Which vendor has the most total documents?
+SQL: SELECT r.extracted_data->>'vendor_name' as vendor, COUNT(DISTINCT d.id) as total_docs
+     FROM documents d JOIN extraction_results r ON r.doc_id = d.id
+     WHERE d.status = 'done' AND r.document_type = 'invoice'
+     AND r.extracted_data->>'vendor_name' IS NOT NULL
+     AND r.extracted_data->>'vendor_name' != ''
+     GROUP BY vendor ORDER BY total_docs DESC LIMIT 1
+
+- When counting documents by vendor, ALWAYS filter: WHERE r.extracted_data->>'vendor_name' IS NOT NULL AND r.extracted_data->>'vendor_name' != ''
+- NEVER group NULL vendor_name values — they represent contracts, not a real vendor
+- "most documents" means COUNT(DISTINCT d.id) grouped by vendor_name
+
 NEWEST/OLDEST RULE:
 - "newest invoice/contract/receipt" / "latest" →
   ORDER BY PARSED_DATE DESC NULLS LAST LIMIT 1
@@ -181,6 +200,14 @@ WHERE r.document_type = 'invoice'
 ORDER BY d.filename, d.created_at ASC
 LIMIT 200;
 
+Question: Which vendor has the most total documents?
+SQL: SELECT r.extracted_data->>'vendor_name' as vendor, COUNT(DISTINCT d.id) as total_docs
+     FROM documents d JOIN extraction_results r ON r.doc_id = d.id
+     WHERE d.status = 'done'
+     AND r.extracted_data->>'vendor_name' IS NOT NULL
+     AND r.extracted_data->>'vendor_name' != ''
+     GROUP BY vendor ORDER BY total_docs DESC LIMIT 1
+
 This returns ALL 9 invoices. The has_duplicate column tells which ones are repeated.
 "oldest" → ORDER BY d.created_at ASC (first row is oldest)
 "newest" → ORDER BY d.created_at DESC
@@ -192,6 +219,8 @@ Rules:
 - "newest" → ORDER BY d.created_at DESC
 - Currency filter: AND r.extracted_data->>'currency' = 'EUR'
 - Amount filter: AND NULLIF(REGEXP_REPLACE(...,'[^0-9.]','','g'),'')::numeric > X
+- When grouping by vendor_name to find top/most vendors, ALWAYS add: WHERE r.extracted_data->>'vendor_name' IS NOT NULL AND r.extracted_data->>'vendor_name' != '' to exclude contracts which have NULL vendor_name
+- Never include NULL vendor_name rows in vendor ranking/counting queries
 
 DEDUPLICATION RULE (ALWAYS apply):
 - Use DISTINCT ON (d.filename) for list queries
@@ -1080,6 +1109,11 @@ def fix_cross_document_exists(sql: str, question: str = "") -> str:
     """
     sql_lower = sql.lower()
     question_lower = (question or "").lower()
+
+    # Don't rewrite EXCEPT queries — LLM correctly uses EXCEPT for
+    # "find X but not in Y" queries. Rewriting would break them.
+    if "except" in sql_lower:
+        return sql
     # Never rewrite aggregation queries (GROUP BY vendor)
     if "group by" in sql_lower:
         return sql
@@ -1217,6 +1251,42 @@ LIMIT 200"""
                 f"dir={direction} exists={exists_keyword}")
     return fixed
 
+def fix_null_vendor_grouping(sql: str) -> str:
+    """
+    Fix GROUP BY vendor queries that don't filter NULL vendor_names.
+    Also fixes missing vendor_name in SELECT when grouping by vendor.
+    """
+    sql_upper = sql.upper()
+    if "GROUP BY" not in sql_upper:
+        return sql
+
+    # Fix: GROUP BY vendor but no vendor_name in SELECT
+    if re.search(r'GROUP\s+BY\s+vendor\b', sql, re.IGNORECASE) and \
+       "vendor_name" not in sql.lower() and \
+       "extracted_data->>'vendor_name'" not in sql:
+        # Add vendor_name to SELECT
+        sql = re.sub(
+            r'SELECT\s+',
+            "SELECT r.extracted_data->>'vendor_name' as vendor, ",
+            sql,
+            count=1,
+            flags=re.IGNORECASE
+        )
+        logger.info("fix_null_vendor_grouping: added vendor_name to SELECT")
+
+    # Add IS NOT NULL filter when grouping by vendor
+    if re.search(r'GROUP\s+BY\s+vendor', sql, re.IGNORECASE):
+        if "vendor_name' IS NOT NULL" not in sql:
+            sql = re.sub(
+                r'(WHERE\s+d\.status\s*=\s*\'done\')',
+                r"\1\n    AND r.extracted_data->>'vendor_name' IS NOT NULL"
+                r"\n    AND r.extracted_data->>'vendor_name' != ''",
+                sql,
+                flags=re.IGNORECASE
+            )
+            logger.info("fix_null_vendor_grouping: added NULL filter")
+
+    return sql
 # def fix_cross_document_vendor_match(sql: str) -> str:
 #     """
 #     Detect IN(SELECT parties...) pattern and rewrite to EXISTS+ILIKE.
@@ -1340,6 +1410,7 @@ def generate_sql(
         # sql = fix_cross_document_amount_filter(sql)
         sql = fix_subquery_to_cte(sql) 
         sql = fix_outer_subquery_references(sql)
+        sql = fix_null_vendor_grouping(sql)
 
         logger.info(f"Generated SQL: {sql[:200]}")
         return sql

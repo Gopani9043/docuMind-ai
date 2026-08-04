@@ -96,6 +96,14 @@ SYNONYM_MAP = {
     r'\bkassenbon\b': 'receipt',
     r'\blieferanten\b': 'vendors',
     r'\blieferant\b': 'vendor',
+    r'\büberfällige\b': 'overdue',
+    r'\büberfällig\b': 'overdue',
+    r'\bablaufende\b': 'expiring',
+    r'\bablaufend\b': 'expiring',
+    r'\bwichtigste\b': 'most important',
+    r'\bwichtigsten\b': 'most important',
+    r'\bdoppelte\b': 'duplicate',
+    r'\bdoppelt\b': 'duplicate',
 }
 
 def normalize_synonyms(question: str) -> str:
@@ -4017,8 +4025,45 @@ Answer:
     # Deduplicate results
     results = deduplicate_results(results)
 
-    # Hard cap
-    # results = results[:50]
+    # ── Enrich duplicate invoice results with full details ────────────────────
+    # When LLM returns {invoice_number, repeat_count} without filename/vendor,
+    # fetch the actual invoice rows for that invoice number
+    if results and results[0].get("invoice_number") and results[0].get("repeat_count") \
+            and not results[0].get("filename"):
+        try:
+            top_inv_num = results[0].get("invoice_number", "").replace("'", "''")
+            enrich_sql = f"""
+                SELECT * FROM (
+                    SELECT DISTINCT ON (d.filename)
+                        d.filename,
+                        r.extracted_data->>'vendor_name' as vendor,
+                        r.extracted_data->>'invoice_number' as invoice_number,
+                        r.extracted_data->>'total_amount' as amount,
+                        r.extracted_data->>'currency' as currency,
+                        r.extracted_data->>'issue_date' as issue_date
+                    FROM documents d
+                    JOIN extraction_results r ON r.doc_id = d.id
+                    WHERE r.document_type = 'invoice'
+                    AND d.status = 'done'
+                    AND r.extracted_data->>'invoice_number' = '{top_inv_num}'
+                    ORDER BY d.filename, d.created_at DESC
+                ) _sub ORDER BY filename DESC NULLS LAST
+            """
+            is_valid, _ = validate_sql(enrich_sql)
+            if is_valid:
+                enriched = await execute_query(enrich_sql, db)
+                if enriched:
+                    # Prepend count summary then actual invoice rows
+                    count = results[0].get("repeat_count", 0)
+                    results = [{
+                        **r,
+                        "repeat_count": count,
+                        "has_dup": "Yes"
+                    } for r in enriched]
+                    logger.info(f"[{session_id}] Enriched duplicate result with {len(results)} rows")
+        except Exception as e:
+            logger.error(f"[{session_id}] Duplicate enrichment failed: {e}")
+
     logger.info(f"[{session_id}] After dedup: {len(results)} rows")
 
     # ── Step 11: Synthesize response ──────────────
